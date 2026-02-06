@@ -32,7 +32,7 @@ show_banner() {
   echo "║  ██████  ██   ██ ███████        ██     ██████  ██   ████ ██   ██ ║"
   echo "║                                                                 ║"
   echo "║                                                              ║"
-  echo "║                GRE/SIT Tunnel Manager v2.0                   ║"
+  echo "║                GRE/SIT Tunnel Manager v3.0                   ║"
   echo "║                Secure Private Networking                     ║"
   echo "║                Created by: Parsa                             ║"
   echo "╚══════════════════════════════════════════════════════════════╝"
@@ -52,63 +52,67 @@ pause() {
   read -rp "Press Enter to continue..."
 }
 
-next_gre() {
-  i=1
-  while ip link show "gre$i" &>/dev/null || ip link show "sit$i" &>/dev/null; do
-    ((i++))
-  done
-  echo "gre$i"
+# تابع برای پیدا کردن نام تونل بعدی
+next_tunnel_name() {
+  local tunnel_type="$1"
+  local i=1
+  
+  if [ "$tunnel_type" = "sit" ]; then
+    while ip link show "sit$i" &>/dev/null || [ -f "$CONFIG_DIR/sit$i.conf" ]; do
+      ((i++))
+    done
+    echo "sit$i"
+  else
+    while ip link show "gre$i" &>/dev/null || [ -f "$CONFIG_DIR/gre$i.conf" ]; do
+      ((i++))
+    done
+    echo "gre$i"
+  fi
 }
 
-detect_public_ip() {
+# تابع تشخیص IP از اینترفیس سرور
+detect_server_ip() {
   local ip=""
   
-  # لیست چندین سرویس مختلف برای تشخیص IP
-  local services=(
-    "https://api.ipify.org"
-    "https://icanhazip.com"
-    "https://ifconfig.me"
-    "https://ipecho.net/plain"
-    "https://checkip.amazonaws.com"
-    "https://ident.me"
-  )
-  
-  # تلاش برای دریافت IP از هر سرویس
-  for service in "${services[@]}"; do
-    ip=$(curl -s --max-time 3 "$service" 2>/dev/null | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
-    
-    # بررسی معتبر بودن IP
-    if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-      # بررسی اینکه octet‌ها در محدوده معتبر باشند
-      local valid=1
-      IFS='.' read -r -a octets <<< "$ip"
-      for octet in "${octets[@]}"; do
-        if [[ $octet -lt 0 || $octet -gt 255 ]]; then
-          valid=0
-          break
-        fi
-      done
-      
-      if [[ $valid -eq 1 ]]; then
-        echo "$ip"
-        return 0
-      fi
-    fi
-  done
-  
-  # روش fallback - استفاده از route
+  # اول: بررسی IP از route به 8.8.8.8
   ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
   
   if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
     echo "$ip"
-  else
-    echo ""
+    return 0
   fi
+  
+  # دوم: بررسی اولین اینترفیس غیر loopback
+  ip=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
+  
+  if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    echo "$ip"
+    return 0
+  fi
+  
+  # سوم: بررسی eth0
+  ip=$(ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+  
+  if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    echo "$ip"
+    return 0
+  fi
+  
+  # چهارم: بررسی ens3, enp0s3, etc
+  for iface in $(ip link show | grep -oE '^[0-9]+: [a-z0-9]+:' | awk '{print $2}' | tr -d ':' | grep -E '^(eth|enp|ens|eno)' | head -1); do
+    ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  
+  echo ""
 }
 
+# تابع برای تشخیص کشور (ساده شده)
 detect_country() {
   local ip="$1"
-  local country
   
   # اگر IP خصوصی باشد
   if [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] || [[ "$ip" =~ ^192\.168\. ]]; then
@@ -116,59 +120,38 @@ detect_country() {
     return 0
   fi
   
-  # تلاش برای تشخیص کشور
-  country=$(curl -s --max-time 3 "ipapi.co/$ip/country/" 2>/dev/null)
-  
-  if [ -n "$country" ] && [ "$country" != "null" ]; then
-    echo "$country"
-    return 0
-  fi
-  
-  # تشخیص تقریبی بر اساس رنج IP ایرانی
-  if [[ "$ip" =~ ^5\. ]] || [[ "$ip" =~ ^(185\.|188\.|94\.|78\.|2\.144\.|2\.176\.|37\.27\.|37\.156\.|46\.100\.|46\.209\.|46\.224\.|77\.104\.|78\.157\.|79\.127\.|79\.175\.|80\.75\.|80\.191\.|81\.12\.|81\.16\.|81\.31\.|82\.99\.|83\.123\.|84\.241\.|85\.133\.|85\.185\.|85\.204\.|86\.104\.|86\.57\.|87\.107\.|87\.247\.|88\.150\.|89\.32\.|89\.43\.|89\.144\.|89\.165\.|91\.92\.|91\.98\.|92\.50\.|93\.110\.|93\.117\.|93\.126\.|94\.74\.|94\.101\.|94\.183\.|94\.184\.|95\.38\.|95\.64\.|95\.80\.|95\.82\.|109\.72\.|109\.109\.|109\.125\.|109\.162\.|128\.65\.|128\.140\.|130\.185\.|130\.255\.|151\.232\.|151\.233\.|151\.238\.|151\.239\.|151\.240\.|151\.241\.|151\.242\.|151\.243\.|151\.244\.|151\.245\.|151\.246\.|151\.247\.|151\.248\.|151\.249\.|151\.250\.|151\.251\.|158\.58\.|159\.20\.|164\.138\.|176\.12\.|176\.102\.|178\.131\.|178\.157\.|178\.173\.|178\.216\.|178\.239\.|178\.252\.|185\.4\.|185\.5\.|185\.10\.|185\.12\.|185\.13\.|185\.14\.|185\.15\.|185\.16\.|185\.17\.|185\.18\.|185\.19\.|185\.20\.|185\.21\.|185\.22\.|185\.23\.|185\.24\.|185\.25\.|185\.26\.|185\.27\.|185\.28\.|185\.29\.|185\.30\.|185\.31\.|185\.32\.|185\.33\.|185\.34\.|185\.35\.|185\.36\.|185\.37\.|185\.38\.|185\.39\.|185\.40\.|185\.41\.|185\.42\.|185\.43\.|185\.44\.|185\.45\.|185\.46\.|185\.47\.|185\.48\.|185\.49\.|185\.50\.|185\.51\.|185\.52\.|185\.53\.|185\.54\.|185\.55\.|185\.56\.|185\.57\.|185\.58\.|185\.59\.|185\.60\.|185\.61\.|185\.62\.|185\.63\.|185\.64\.|185\.65\.|185\.66\.|185\.67\.|185\.68\.|185\.69\.|185\.70\.|185\.71\.|185\.72\.|185\.73\.|185\.74\.|185\.75\.|185\.76\.|185\.77\.|185\.78\.|185\.79\.|185\.80\.|185\.81\.|185\.82\.|185\.83\.|185\.84\.|185\.85\.|185\.86\.|185\.87\.|185\.88\.|185\.89\.|185\.90\.|185\.91\.|185\.92\.|185\.93\.|185\.94\.|185\.95\.|185\.96\.|185\.97\.|185\.98\.|185\.99\.|185\.100\.|185\.101\.|185\.102\.|185\.103\.|185\.104\.|185\.105\.|185\.106\.|185\.107\.|185\.108\.|185\.109\.|185\.110\.|185\.111\.|185\.112\.|185\.113\.|185\.114\.|185\.115\.|185\.116\.|185\.117\.|185\.118\.|185\.119\.|185\.120\.|185\.121\.|185\.122\.|185\.123\.|185\.124\.|185\.125\.|185\.126\.|185\.127\.|185\.128\.|185\.129\.|185\.130\.|185\.131\.|185\.132\.|185\.133\.|185\.134\.|185\.135\.|185\.136\.|185\.137\.|185\.138\.|185\.139\.|185\.140\.|185\.141\.|185\.142\.|185\.143\.|185\.144\.|185\.145\.|185\.146\.|185\.147\.|185\.148\.|185\.149\.|185\.150\.|185\.151\.|185\.152\.|185\.153\.|185\.154\.|185\.155\.|185\.156\.|185\.157\.|185\.158\.|185\.159\.|185\.160\.|185\.161\.|185\.162\.|185\.163\.|185\.164\.|185\.165\.|185\.166\.|185\.167\.|185\.168\.|185\.169\.|185\.170\.|185\.171\.|185\.172\.|185\.173\.|185\.174\.|185\.175\.|185\.176\.|185\.177\.|185\.178\.|185\.179\.|185\.180\.|185\.181\.|185\.182\.|185\.183\.|185\.184\.|185\.185\.|185\.186\.|185\.187\.|185\.188\.|185\.189\.|185\.190\.|185\.191\.|185\.192\.|185\.193\.|185\.194\.|185\.195\.|185\.196\.|185\.197\.|185\.198\.|185\.199\.|185\.200\.|185\.201\.|185\.202\.|185\.203\.|185\.204\.|185\.205\.|185\.206\.|185\.207\.|185\.208\.|185\.209\.|185\.210\.|185\.211\.|185\.212\.|185\.213\.|185\.214\.|185\.215\.|185\.216\.|185\.217\.|185\.218\.|185\.219\.|185\.220\.|185\.221\.|185\.222\.|185\.223\.|185\.224\.|185\.225\.|185\.226\.|185\.227\.|185\.228\.|185\.229\.|185\.230\.|185\.231\.|185\.232\.|185\.233\.|185\.234\.|185\.235\.|185\.236\.|185\.237\.|185\.238\.|185\.239\.|185\.240\.|185\.241\.|185\.242\.|185\.243\.|185\.244\.|185\.245\.|185\.246\.|185\.247\.|185\.248\.|185\.249\.|185\.250\.|185\.251\.|185\.252\.|185\.253\.|185\.254\.|185\.255\.) ]]; then
+  # تشخیص ساده: اگر IP با 5 شروع شود یا در رنج‌های ایرانی باشد
+  if [[ "$ip" =~ ^5\. ]] || [[ "$ip" =~ ^(185\.|188\.|94\.|78\.|37\.27\.|46\.100\.|46\.209\.) ]]; then
     echo "IR"
   else
     echo "FOREIGN"
   fi
 }
 
-suggest_ip_for_country() {
+# تابع برای پیشنهاد IPv4 برای GRE tunnel
+suggest_gre_ip() {
   local country="$1"
   local tunnel_type="$2"  # local یا remote
-  local tunnel_protocol="$3"  # gre یا sit
   
-  # پیدا کردن subnet آزاد
+  # پیدا کردن subnet آزاد برای GRE
   for i in {100..200}; do
-    if ! grep -r "192\.168\.$i\." "$CONFIG_DIR" &>/dev/null; then
+    local config_exists=false
+    for conf in "$CONFIG_DIR"/*.conf 2>/dev/null; do
+      [ -f "$conf" ] && grep -q "192\.168\.$i\." "$conf" && config_exists=true
+    done
+    
+    if [ "$config_exists" = false ]; then
       if [ "$country" = "IR" ] || [ "$country" = "Iran" ]; then
-        if [ "$tunnel_protocol" = "sit" ]; then
-          # برای SIT tunnel می‌توان از رنج متفاوتی استفاده کرد
-          if [ "$tunnel_type" = "local" ]; then
-            echo "192.168.$i.1/30"
-          else
-            echo "192.168.$i.2/30"
-          fi
+        if [ "$tunnel_type" = "local" ]; then
+          echo "192.168.$i.1/30"
         else
-          # برای GRE tunnel
-          if [ "$tunnel_type" = "local" ]; then
-            echo "192.168.$i.1/30"
-          else
-            echo "192.168.$i.2/30"
-          fi
+          echo "192.168.$i.2/30"
         fi
       else
-        if [ "$tunnel_protocol" = "sit" ]; then
-          if [ "$tunnel_type" = "local" ]; then
-            echo "192.168.$i.2/30"
-          else
-            echo "192.168.$i.1/30"
-          fi
+        if [ "$tunnel_type" = "local" ]; then
+          echo "192.168.$i.2/30"
         else
-          if [ "$tunnel_type" = "local" ]; then
-            echo "192.168.$i.2/30"
-          else
-            echo "192.168.$i.1/30"
-          fi
+          echo "192.168.$i.1/30"
         fi
       fi
       return 0
@@ -177,36 +160,359 @@ suggest_ip_for_country() {
   
   # اگر همه پر بودند
   if [ "$country" = "IR" ] || [ "$country" = "Iran" ]; then
-    if [ "$tunnel_protocol" = "sit" ]; then
-      echo "192.168.150.1/30"  # رنج متفاوت برای SIT
-    else
-      echo "192.168.100.1/30"
-    fi
+    echo "192.168.100.1/30"
   else
-    if [ "$tunnel_protocol" = "sit" ]; then
-      echo "192.168.150.2/30"  # رنج متفاوت برای SIT
-    else
-      echo "192.168.100.2/30"
-    fi
+    echo "192.168.100.2/30"
   fi
 }
 
-suggest_ping_target() {
-  local tun_ip="$1"
-  local country="$2"
+# تابع برای پیشنهاد IPv6 برای SIT tunnel
+suggest_sit_ipv6() {
+  local country="$1"
+  local tunnel_type="$2"  # local یا remote
   
-  # استخراج IP از subnet
-  local ip=$(echo "$tun_ip" | cut -d'/' -f1)
-  local base=$(echo "$ip" | sed 's/\.[0-9]*$//')
-  local last=$(echo "$ip" | awk -F. '{print $4}')
+  # پیدا کردن subnet آزاد برای SIT (IPv6)
+  for i in {1..100}; do
+    local hex_i=$(printf "%02x" $i)
+    local config_exists=false
+    
+    for conf in "$CONFIG_DIR"/*.conf 2>/dev/null; do
+      [ -f "$conf" ] && grep -q "fd00:$hex_i:" "$conf" && config_exists=true
+    done
+    
+    if [ "$config_exists" = false ]; then
+      if [ "$country" = "IR" ] || [ "$country" = "Iran" ]; then
+        if [ "$tunnel_type" = "local" ]; then
+          echo "fd00:$hex_i::1/64"
+        else
+          echo "fd00:$hex_i::2/64"
+        fi
+      else
+        if [ "$tunnel_type" = "local" ]; then
+          echo "fd00:$hex_i::2/64"
+        else
+          echo "fd00:$hex_i::1/64"
+        fi
+      fi
+      return 0
+    fi
+  done
   
+  # اگر همه پر بودند
   if [ "$country" = "IR" ] || [ "$country" = "Iran" ]; then
-    # اگر ایران هستیم، هدف پینگ IP دوم است
-    echo "$base.$((last + 1))"
+    echo "fd00:100::1/64"
   else
-    # اگر خارج هستیم، هدف پینگ IP اول است
-    echo "$base.$((last - 1))"
+    echo "fd00:100::2/64"
   fi
+}
+
+# ---------- functions for tunnel management ----------
+
+list_all_tunnels() {
+  echo -e "\n${YELLOW}=== Active Tunnel Interfaces ===${RESET}"
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  
+  local found=0
+  
+  # GRE tunnels
+  for iface in $(ip link show 2>/dev/null | grep -oE 'gre[0-9]+:' | tr -d ':' | sort -V); do
+    found=1
+    local status=$(ip link show "$iface" 2>/dev/null | grep -oE 'state (UP|DOWN)' || echo "state UNKNOWN")
+    local ip=$(ip addr show "$iface" 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | head -1 | cut -d' ' -f2 || echo "No IP")
+    
+    if echo "$status" | grep -q "UP"; then
+      echo -e "${GREEN}✓ GRE  $iface${RESET}  $status  IP: ${BLUE}$ip${RESET}"
+    else
+      echo -e "${RED}✗ GRE  $iface${RESET}  $status  IP: ${BLUE}$ip${RESET}"
+    fi
+  done
+  
+  # SIT tunnels
+  for iface in $(ip link show 2>/dev/null | grep -oE 'sit[0-9]+:' | tr -d ':' | sort -V); do
+    found=1
+    local status=$(ip link show "$iface" 2>/dev/null | grep -oE 'state (UP|DOWN)' || echo "state UNKNOWN")
+    local ip=$(ip -6 addr show "$iface" 2>/dev/null | grep -oE 'inet6 [a-f0-9:]+/[0-9]+' | head -1 | cut -d' ' -f2 || echo "No IPv6")
+    
+    if echo "$status" | grep -q "UP"; then
+      echo -e "${CYAN}✓ SIT  $iface${RESET}  $status  IPv6: ${BLUE}$ip${RESET}"
+    else
+      echo -e "${RED}✗ SIT  $iface${RESET}  $status  IPv6: ${BLUE}$ip${RESET}"
+    fi
+  done
+  
+  # نمایش تونل‌های config شده اما غیرفعال
+  shopt -s nullglob
+  for conf in "$CONFIG_DIR"/*.conf; do
+    local dev=$(basename "$conf" .conf)
+    
+    # اگر اینترفیس فعال نیست
+    if ! ip link show "$dev" &>/dev/null; then
+      found=1
+      local tunnel_type="gre"
+      local ip=""
+      local local_ip=""
+      local remote_ip=""
+      
+      # خواندن اطلاعات از config
+      while IFS='=' read -r key value; do
+        case "$key" in
+          TUNNEL_TYPE) tunnel_type="$value" ;;
+          TUN_IP) ip="$value" ;;
+          LOCAL_IP) local_ip="$value" ;;
+          REMOTE_IP) remote_ip="$value" ;;
+        esac
+      done < "$conf"
+      
+      if [ "$tunnel_type" = "sit" ]; then
+        echo -e "${YELLOW}● SIT  $dev${RESET}  state DOWN  IPv6: ${ip:-"Unknown"}  Remote: ${remote_ip:-"Unknown"}"
+      else
+        echo -e "${YELLOW}● GRE  $dev${RESET}  state DOWN  IP: ${ip:-"Unknown"}  Remote: ${remote_ip:-"Unknown"}"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  
+  if [ $found -eq 0 ]; then
+    echo -e "${YELLOW}No tunnel interfaces found${RESET}"
+  fi
+  
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+delete_tunnel() {
+  show_banner
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  echo -e "${RED}                     DELETE TUNNEL                           ${RESET}"
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
+  
+  # لیست تونل‌های موجود
+  list_all_tunnels
+  
+  echo -e "\n${YELLOW}=== Configured Tunnels ===${RESET}"
+  
+  shopt -s nullglob
+  local CONFS=("$CONFIG_DIR"/*.conf)
+  shopt -u nullglob
+  
+  if [ ${#CONFS[@]} -eq 0 ]; then
+    echo -e "\n${RED}No tunnel configurations found!${RESET}"
+    pause
+    return 1
+  fi
+  
+  echo -e "\n${BLUE}Select tunnel to delete:${RESET}"
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  
+  local i=1
+  for conf in "${CONFS[@]}"; do
+    local dev=$(basename "$conf" .conf)
+    local tunnel_type="gre"
+    local local_ip=""
+    local remote_ip=""
+    
+    # خواندن اطلاعات از config
+    while IFS='=' read -r key value; do
+      case "$key" in
+        TUNNEL_TYPE) tunnel_type="$value" ;;
+        LOCAL_IP) local_ip="$value" ;;
+        REMOTE_IP) remote_ip="$value" ;;
+      esac
+    done < "$conf"
+    
+    if ip link show "$dev" &>/dev/null; then
+      echo -e "${GREEN}$i) $tunnel_type $dev${RESET} - ${local_ip} → ${remote_ip} (ACTIVE)"
+    else
+      echo -e "${YELLOW}$i) $tunnel_type $dev${RESET} - ${local_ip} → ${remote_ip} (INACTIVE)"
+    fi
+    ((i++))
+  done
+  
+  echo -e "$i) Cancel"
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  
+  read -rp "Select tunnel number [1-$i]: " selection
+  
+  # بررسی انتخاب
+  if [[ ! "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt $i ]; then
+    echo -e "${RED}Invalid selection!${RESET}"
+    pause
+    return 1
+  fi
+  
+  # اگر Cancel انتخاب شده
+  if [ "$selection" -eq $i ]; then
+    echo -e "${YELLOW}Operation cancelled.${RESET}"
+    pause
+    return 0
+  fi
+  
+  local conf="${CONFS[$((selection-1))]}"
+  local DEV=$(basename "$conf" .conf)
+  
+  # خواندن اطلاعات تونل
+  local TUNNEL_TYPE="gre"
+  local LOCAL_IP=""
+  local REMOTE_IP=""
+  
+  while IFS='=' read -r key value; do
+    case "$key" in
+      TUNNEL_TYPE) TUNNEL_TYPE="$value" ;;
+      LOCAL_IP) LOCAL_IP="$value" ;;
+      REMOTE_IP) REMOTE_IP="$value" ;;
+    esac
+  done < "$conf"
+  
+  echo -e "\n${RED}⚠  WARNING: You are about to delete $TUNNEL_TYPE tunnel $DEV${RESET}"
+  echo -e "${RED}   Local IP: $LOCAL_IP"
+  echo -e "${RED}   Remote IP: $REMOTE_IP${RESET}"
+  echo -e "${RED}   This action cannot be undone!${RESET}\n"
+  
+  read -rp "Type 'DELETE' to confirm: " confirm
+  if [ "$confirm" != "DELETE" ]; then
+    echo -e "${YELLOW}Deletion cancelled.${RESET}"
+    pause
+    return 0
+  fi
+  
+  echo -e "\n${YELLOW}Deleting $TUNNEL_TYPE tunnel $DEV...${RESET}"
+  
+  # توقف سرویس‌ها
+  echo -e "${BLUE}Stopping services...${RESET}"
+  systemctl stop "gre-watch@$DEV" 2>/dev/null
+  systemctl stop "gre@$DEV" 2>/dev/null
+  systemctl disable "gre-watch@$DEV" "gre@$DEV" 2>/dev/null
+  
+  # حذف تونل
+  echo -e "${BLUE}Removing tunnel interface...${RESET}"
+  ip link set "$DEV" down 2>/dev/null
+  ip tunnel del "$DEV" 2>/dev/null
+  
+  # حذف فایل‌ها
+  echo -e "${BLUE}Removing configuration files...${RESET}"
+  rm -f "$conf"
+  rm -f "$SERVICE_DIR/gre@$DEV.service"
+  rm -f "$SERVICE_DIR/gre-watch@$DEV.service"
+  
+  echo -e "${BLUE}Reloading systemd daemon...${RESET}"
+  systemctl daemon-reload
+  systemctl reset-failed 2>/dev/null
+  
+  log_message "$TUNNEL_TYPE tunnel $DEV deleted"
+  
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  echo -e "${GREEN}✓ $TUNNEL_TYPE tunnel $DEV removed successfully!${RESET}"
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  pause
+}
+
+status_tunnels() {
+  show_banner
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  echo -e "${BLUE}                   TUNNEL STATUS                             ${RESET}"
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
+  
+  list_all_tunnels
+  
+  echo -e "\n${YELLOW}=== Detailed Status ===${RESET}"
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  
+  shopt -s nullglob
+  local found=0
+  local total_up=0
+  local total_down=0
+  
+  for c in "$CONFIG_DIR"/*.conf; do
+    found=1
+    
+    # خواندن config
+    local DEV="" PING_TARGET="" TUN_IP="" LOCAL_IP="" REMOTE_IP="" TUNNEL_TYPE="" LOCAL_COUNTRY=""
+    while IFS='=' read -r key value; do
+      case "$key" in
+        DEV) DEV="$value" ;;
+        PING_TARGET) PING_TARGET="$value" ;;
+        TUN_IP) TUN_IP="$value" ;;
+        LOCAL_IP) LOCAL_IP="$value" ;;
+        REMOTE_IP) REMOTE_IP="$value" ;;
+        TUNNEL_TYPE) TUNNEL_TYPE="$value" ;;
+        LOCAL_COUNTRY) LOCAL_COUNTRY="$value" ;;
+      esac
+    done < "$c"
+    
+    # تعیین رنگ و نماد
+    local type_color=$BLUE
+    local type_symbol="🌉"
+    if [ "$TUNNEL_TYPE" = "sit" ]; then
+      type_color=$CYAN
+      type_symbol="🔗"
+    fi
+    
+    # بررسی وضعیت
+    if ip link show "$DEV" &>/dev/null; then
+      if [ "$TUNNEL_TYPE" = "sit" ]; then
+        # برای SIT از ping6 استفاده کن
+        if ping6 -c1 -W1 "$PING_TARGET" >/dev/null 2>&1; then
+          echo -e "${GREEN}✅${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${GREEN}$DEV${RESET}"
+          echo -e "   Status: ${GREEN}UP${RESET} $type_symbol"
+          echo -e "   Tunnel IPv6: ${BLUE}$TUN_IP${RESET}"
+          echo -e "   Local IPv4: ${CYAN}$LOCAL_IP${RESET}"
+          echo -e "   Remote IPv4: ${CYAN}$REMOTE_IP${RESET}"
+          echo -e "   Ping: ${GREEN}Success ✓${RESET}"
+          ((total_up++))
+        else
+          echo -e "${YELLOW}⚠${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${YELLOW}$DEV${RESET}"
+          echo -e "   Status: ${YELLOW}UP (ping failed)${RESET} $type_symbol"
+          echo -e "   Tunnel IPv6: ${BLUE}$TUN_IP${RESET}"
+          echo -e "   Local IPv4: ${CYAN}$LOCAL_IP${RESET}"
+          echo -e "   Remote IPv4: ${CYAN}$REMOTE_IP${RESET}"
+          echo -e "   Ping: ${RED}Failed ✗${RESET}"
+          ((total_down++))
+        fi
+      else
+        # برای GRE از ping معمولی استفاده کن
+        if ping -c1 -W1 "$PING_TARGET" >/dev/null 2>&1; then
+          echo -e "${GREEN}✅${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${GREEN}$DEV${RESET}"
+          echo -e "   Status: ${GREEN}UP${RESET} $type_symbol"
+          echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
+          echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
+          echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
+          echo -e "   Ping: ${GREEN}Success ✓${RESET}"
+          ((total_up++))
+        else
+          echo -e "${YELLOW}⚠${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${YELLOW}$DEV${RESET}"
+          echo -e "   Status: ${YELLOW}UP (ping failed)${RESET} $type_symbol"
+          echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
+          echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
+          echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
+          echo -e "   Ping: ${RED}Failed ✗${RESET}"
+          ((total_down++))
+        fi
+      fi
+    else
+      echo -e "${RED}❌${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${RED}$DEV${RESET}"
+      echo -e "   Status: ${RED}DOWN${RESET} $type_symbol"
+      echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
+      echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
+      echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
+      ((total_down++))
+    fi
+    echo
+  done
+  
+  [ "$found" -eq 0 ] && echo -e "${YELLOW}No tunnel configurations found${RESET}"
+  
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  echo -e "${BLUE}Summary:${RESET}"
+  echo -e "  Up tunnels: ${GREEN}$total_up${RESET}"
+  echo -e "  Down tunnels: ${RED}$total_down${RESET}"
+  echo -e "  Total: $((total_up + total_down))"
+  
+  if [ $total_up -gt 0 ]; then
+    echo -e "\n${GREEN}✅ Tunnels are running in background.${RESET}"
+    echo -e "${BLUE}You can safely exit this menu.${RESET}"
+  fi
+  
+  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+  pause
 }
 
 # ---------- gre/sit runtime script ----------
@@ -237,72 +543,74 @@ done < "$CONF"
 if [ "$TUNNEL_TYPE" = "sit" ]; then
   modprobe ip_tunnel 2>/dev/null
   modprobe sit 2>/dev/null
-  echo "Loaded SIT tunnel modules"
 else
   modprobe ip_gre 2>/dev/null
-  echo "Loaded GRE tunnel modules"
 fi
 
+# فعال کردن IP forwarding
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+if [ "$TUNNEL_TYPE" = "sit" ]; then
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+fi
 
 case "$1" in
   start)
     echo "Starting $TUNNEL_TYPE tunnel $DEV"
+    
     # حذف تونل قبلی اگر وجود دارد
     ip tunnel del "$DEV" 2>/dev/null
     
     # ایجاد تونل بر اساس نوع
     if [ "$TUNNEL_TYPE" = "sit" ]; then
-      echo "Creating SIT tunnel: ip tunnel add $DEV mode sit local $LOCAL_IP remote $REMOTE_IP ttl 255"
       ip tunnel add "$DEV" mode sit local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
     else
-      echo "Creating GRE tunnel: ip tunnel add $DEV mode gre local $LOCAL_IP remote $REMOTE_IP ttl 255"
       ip tunnel add "$DEV" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
     fi
     
-    # تنظیم IP
-    ip addr flush dev "$DEV" 2>/dev/null
-    echo "Setting IP: ip addr add $TUN_IP dev $DEV"
-    ip addr add "$TUN_IP" dev "$DEV"
-    ip link set "$DEV" up
-    
-    # برای SIT tunnel، تنظیمات اضافی
+    # تنظیم IP بر اساس نوع تونل
     if [ "$TUNNEL_TYPE" = "sit" ]; then
-      # فعال کردن IPv6 روی اینترفیس
+      ip -6 addr add "$TUN_IP" dev "$DEV"
+      # فعال کردن IPv6
       sysctl -w net.ipv6.conf.$DEV.disable_ipv6=0 >/dev/null 2>&1
       sysctl -w net.ipv6.conf.$DEV.autoconf=0 >/dev/null 2>&1
       sysctl -w net.ipv6.conf.$DEV.accept_ra=0 >/dev/null 2>&1
+    else
+      ip addr add "$TUN_IP" dev "$DEV"
     fi
     
-    echo "$TUNNEL_TYPE tunnel $DEV started with IP $TUN_IP"
+    ip link set "$DEV" up
+    echo "$TUNNEL_TYPE tunnel $DEV started"
     ;;
   stop)
     echo "Stopping tunnel $DEV"
     ip link set "$DEV" down 2>/dev/null
     ip tunnel del "$DEV" 2>/dev/null
-    echo "Tunnel $DEV stopped"
     ;;
   restart)
-    echo "Restarting tunnel $DEV"
     "$0" stop "$DEV"
     sleep 1
     "$0" start "$DEV"
     ;;
   check)
-    if ! ping -c1 -W2 "$PING_TARGET" >/dev/null 2>&1; then
-      echo "$(date) $DEV DOWN, restarting" >> /var/log/gre-watch.log
-      "$0" restart "$DEV"
+    if [ "$TUNNEL_TYPE" = "sit" ]; then
+      if ! ping6 -c1 -W2 "$PING_TARGET" >/dev/null 2>&1; then
+        echo "$(date) $DEV DOWN, restarting" >> /var/log/gre-watch.log
+        "$0" restart "$DEV"
+      fi
+    else
+      if ! ping -c1 -W2 "$PING_TARGET" >/dev/null 2>&1; then
+        echo "$(date) $DEV DOWN, restarting" >> /var/log/gre-watch.log
+        "$0" restart "$DEV"
+      fi
     fi
     ;;
   status)
     if ip link show "$DEV" &>/dev/null; then
       echo "Tunnel $DEV: UP"
-      ip addr show dev "$DEV"
-      
-      # اطلاعات اضافی برای SIT
       if [ "$TUNNEL_TYPE" = "sit" ]; then
-        echo "IPv6 configuration:"
-        ip -6 addr show dev "$DEV" 2>/dev/null || echo "No IPv6 address configured"
+        ip -6 addr show dev "$DEV" 2>/dev/null
+      else
+        ip addr show dev "$DEV" 2>/dev/null
       fi
     else
       echo "Tunnel $DEV: DOWN"
@@ -336,37 +644,29 @@ create_service() {
 Description=$TUNNEL_TYPE Tunnel $DEV
 After=network-online.target
 Wants=network-online.target
-Documentation=man:gre(8)
 
 [Service]
 Type=oneshot
 ExecStart=$SCRIPT start $DEV
 ExecStop=$SCRIPT stop $DEV
 RemainAfterExit=yes
-User=root
-Group=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  # سرویس watchdog برای مانیتورینگ
+  # سرویس watchdog
   cat > "$SERVICE_DIR/gre-watch@$DEV.service" <<EOF
 [Unit]
 Description=$TUNNEL_TYPE Watchdog $DEV
 After=gre@$DEV.service
 Requires=gre@$DEV.service
-PartOf=gre@$DEV.service
 
 [Service]
 Type=simple
 ExecStart=/bin/bash -c 'while true; do $SCRIPT check $DEV; sleep 10; done'
 Restart=always
 RestartSec=5
-User=root
-Group=root
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -375,7 +675,7 @@ EOF
   echo -e "${GREEN}✓ Systemd services created for $DEV${RESET}"
 }
 
-# ---------- actions ----------
+# ---------- create tunnel ----------
 
 create_tunnel() {
   show_banner
@@ -385,125 +685,74 @@ create_tunnel() {
   
   # انتخاب نوع تونل
   echo -e "${YELLOW}Select tunnel type:${RESET}"
-  echo "1) GRE Tunnel (Recommended for most cases) - IPv4 over IPv4"
-  echo "2) SIT Tunnel (IPv6 over IPv4) - For IPv6 connectivity"
+  echo "1) GRE Tunnel - IPv4 over IPv4 (Recommended)"
+  echo "2) SIT Tunnel - IPv6 over IPv4"
   read -rp "Enter choice [1-2, default=1]: " tunnel_choice
   
   case "$tunnel_choice" in
-    2) 
-      TUNNEL_TYPE="sit"
-      echo -e "${CYAN}Selected: SIT Tunnel (IPv6 over IPv4)${RESET}"
-      echo -e "${YELLOW}Note: SIT tunnels encapsulate IPv6 traffic over IPv4${RESET}"
-      ;;
-    *) 
-      TUNNEL_TYPE="gre"
-      echo -e "${CYAN}Selected: GRE Tunnel (IPv4 over IPv4)${RESET}"
-      ;;
+    2) TUNNEL_TYPE="sit" ;;
+    *) TUNNEL_TYPE="gre" ;;
   esac
   
-  local DEV
-  if [ "$TUNNEL_TYPE" = "sit" ]; then
-    # برای SIT، نام‌های sitX را بررسی کن
-    i=1
-    while ip link show "sit$i" &>/dev/null; do
-      ((i++))
-    done
-    DEV="sit$i"
-  else
-    # برای GRE، نام‌های greX را بررسی کن
-    i=1
-    while ip link show "gre$i" &>/dev/null; do
-      ((i++))
-    done
-    DEV="gre$i"
-  fi
-  
-  echo -e "\n${YELLOW}Next available tunnel name: ${GREEN}$DEV${RESET}\n"
+  local DEV=$(next_tunnel_name "$TUNNEL_TYPE")
+  echo -e "\n${YELLOW}Tunnel name: ${GREEN}$DEV${RESET}\n"
 
-  # تشخیص IP محلی
-  echo -e "${BLUE}Detecting your public IP address...${RESET}"
-  local AUTO_IP=$(detect_public_ip)
+  # تشخیص IP سرور
+  echo -e "${BLUE}Detecting server IP address...${RESET}"
+  local SERVER_IP=$(detect_server_ip)
   
-  if [ -n "$AUTO_IP" ]; then
-    echo -e "${GREEN}✓ Detected your public IP: $AUTO_IP${RESET}"
-    read -rp "Local PUBLIC IP [$AUTO_IP]: " LOCAL_IP
-    LOCAL_IP=${LOCAL_IP:-$AUTO_IP}
+  if [ -n "$SERVER_IP" ]; then
+    echo -e "${GREEN}✓ Detected server IP: $SERVER_IP${RESET}"
+    read -rp "Local server IP [$SERVER_IP]: " LOCAL_IP
+    LOCAL_IP=${LOCAL_IP:-$SERVER_IP}
   else
-    echo -e "${RED}✗ Could not detect public IP automatically${RESET}"
-    echo -e "${YELLOW}Please enter your public IP address manually:${RESET}"
-    read -rp "Local PUBLIC IP: " LOCAL_IP
-    while [[ ! "$LOCAL_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; do
-      echo -e "${RED}Invalid IP address format. Please enter a valid IP:${RESET}"
-      read -rp "Local PUBLIC IP: " LOCAL_IP
-    done
+    echo -e "${RED}✗ Could not detect server IP${RESET}"
+    read -rp "Local server IP: " LOCAL_IP
   fi
   
-  # تشخیص کشور
-  local LOCAL_COUNTRY=$(detect_country "$LOCAL_IP")
-  echo -e "${BLUE}Detected country: ${GREEN}$LOCAL_COUNTRY${RESET}"
   echo
 
   # دریافت IP سرور مقابل
-  read -rp "Remote PUBLIC IP: " REMOTE_IP
-  while [[ ! "$REMOTE_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; do
-    echo -e "${RED}Invalid IP address format. Please enter a valid IP:${RESET}"
-    read -rp "Remote PUBLIC IP: " REMOTE_IP
-  done
-  
-  # تشخیص کشور سرور مقابل
-  local REMOTE_COUNTRY=$(detect_country "$REMOTE_IP")
-  echo -e "${BLUE}Remote server country: ${GREEN}$REMOTE_COUNTRY${RESET}"
+  read -rp "Remote server IP: " REMOTE_IP
   echo
 
-  # پیشنهاد IP بر اساس کشور و نوع تونل
-  local SUGGESTED_LOCAL_IP=$(suggest_ip_for_country "$LOCAL_COUNTRY" "local" "$TUNNEL_TYPE")
-  local SUGGESTED_REMOTE_IP=$(suggest_ip_for_country "$LOCAL_COUNTRY" "remote" "$TUNNEL_TYPE")
+  # پیشنهاد IP بر اساس نوع تونل
+  local LOCAL_COUNTRY=$(detect_country "$LOCAL_IP")
   
-  echo -e "${MAGENTA}Suggested IP configuration:${RESET}"
-  if [ "$LOCAL_COUNTRY" = "IR" ] || [ "$LOCAL_COUNTRY" = "Iran" ]; then
-    echo -e "  Your tunnel IP (Iran server): ${GREEN}$SUGGESTED_LOCAL_IP${RESET}"
-    echo -e "  Remote tunnel IP: ${CYAN}$SUGGESTED_REMOTE_IP${RESET}"
-  else
-    echo -e "  Your tunnel IP (Foreign server): ${GREEN}$SUGGESTED_LOCAL_IP${RESET}"
-    echo -e "  Remote tunnel IP (Iran server): ${CYAN}$SUGGESTED_REMOTE_IP${RESET}"
-  fi
-  
-  # برای SIT توضیح اضافی
   if [ "$TUNNEL_TYPE" = "sit" ]; then
-    echo -e "  ${YELLOW}Note: For SIT tunnels, IPv6 addresses will be configured separately${RESET}"
-  fi
-  
-  read -rp "Your tunnel IP [$SUGGESTED_LOCAL_IP]: " TUN_IP
-  TUN_IP=${TUN_IP:-$SUGGESTED_LOCAL_IP}
-  
-  # اعتبارسنجی فرمت IP
-  while [[ ! "$TUN_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; do
-    echo -e "${RED}Invalid format. Use format like 192.168.100.1/30:${RESET}"
-    read -rp "Your tunnel IP [$SUGGESTED_LOCAL_IP]: " TUN_IP
+    SUGGESTED_LOCAL_IP=$(suggest_sit_ipv6 "$LOCAL_COUNTRY" "local")
+    echo -e "${MAGENTA}Suggested IPv6 address: ${GREEN}$SUGGESTED_LOCAL_IP${RESET}"
+    
+    read -rp "Your tunnel IPv6 [$SUGGESTED_LOCAL_IP]: " TUN_IP
     TUN_IP=${TUN_IP:-$SUGGESTED_LOCAL_IP}
-  done
-  
-  echo
-
-  # پیشنهاد IP برای پینگ
-  local SUGGESTED_PING=$(suggest_ping_target "$TUN_IP" "$LOCAL_COUNTRY")
-  
-  if [ "$LOCAL_COUNTRY" = "IR" ] || [ "$LOCAL_COUNTRY" = "Iran" ]; then
-    echo -e "${BLUE}Suggested ping target (remote private IP): ${GREEN}$SUGGESTED_PING${RESET}"
+    
+    # پیشنهاد IP برای پینگ
+    local base_ip=$(echo "$TUN_IP" | sed 's/::[0-9a-f]*\/.*//')
+    if [[ "$TUN_IP" =~ ::1/ ]]; then
+      SUGGESTED_PING="${base_ip}::2"
+    else
+      SUGGESTED_PING="${base_ip}::1"
+    fi
   else
-    echo -e "${BLUE}Suggested ping target (Iran server private IP): ${GREEN}$SUGGESTED_PING${RESET}"
+    SUGGESTED_LOCAL_IP=$(suggest_gre_ip "$LOCAL_COUNTRY" "local")
+    echo -e "${MAGENTA}Suggested IPv4 address: ${GREEN}$SUGGESTED_LOCAL_IP${RESET}"
+    
+    read -rp "Your tunnel IPv4 [$SUGGESTED_LOCAL_IP]: " TUN_IP
+    TUN_IP=${TUN_IP:-$SUGGESTED_LOCAL_IP}
+    
+    # پیشنهاد IP برای پینگ
+    local base_ip=$(echo "$TUN_IP" | sed 's/\.[0-9]*\/.*//')
+    local last_digit=$(echo "$TUN_IP" | grep -oE '[0-9]+/' | head -1 | tr -d '/')
+    if [ "$last_digit" = "1" ]; then
+      SUGGESTED_PING="${base_ip}.2"
+    else
+      SUGGESTED_PING="${base_ip}.1"
+    fi
   fi
   
-  read -rp "Remote PRIVATE IP for ping [$SUGGESTED_PING]: " PING_TARGET
+  echo -e "${BLUE}Suggested ping target: ${GREEN}$SUGGESTED_PING${RESET}"
+  read -rp "Ping target IP [$SUGGESTED_PING]: " PING_TARGET
   PING_TARGET=${PING_TARGET:-$SUGGESTED_PING}
-  
-  # اعتبارسنجی IP پینگ
-  while [[ ! "$PING_TARGET" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; do
-    echo -e "${RED}Invalid IP address format. Please enter a valid IP:${RESET}"
-    read -rp "Remote PRIVATE IP for ping [$SUGGESTED_PING]: " PING_TARGET
-    PING_TARGET=${PING_TARGET:-$SUGGESTED_PING}
-  done
-  
   echo
 
   # ایجاد فایل config
@@ -511,17 +760,12 @@ create_tunnel() {
   cat > "$CONFIG_DIR/$DEV.conf" <<EOF
 # $TUNNEL_TYPE Tunnel Configuration
 # Created: $(date)
-# Created by: Parsa
-# Local Country: $LOCAL_COUNTRY
-# Remote Country: $REMOTE_COUNTRY
 DEV=$DEV
 LOCAL_IP=$LOCAL_IP
 REMOTE_IP=$REMOTE_IP
 TUN_IP=$TUN_IP
 PING_TARGET=$PING_TARGET
 TUNNEL_TYPE=$TUNNEL_TYPE
-LOCAL_COUNTRY=$LOCAL_COUNTRY
-REMOTE_COUNTRY=$REMOTE_COUNTRY
 EOF
 
   echo -e "${GREEN}✓ Configuration saved to $CONFIG_DIR/$DEV.conf${RESET}"
@@ -532,99 +776,18 @@ EOF
   # ایجاد سرویس systemd
   create_service "$DEV" "$TUNNEL_TYPE"
 
-  echo -e "\n${YELLOW}Reloading systemd daemon...${RESET}"
+  echo -e "\n${YELLOW}Starting tunnel...${RESET}"
   systemctl daemon-reload
-  
-  echo -e "\n${YELLOW}Enabling and starting services...${RESET}"
-  systemctl enable --now "gre@$DEV" > /dev/null 2>&1
-  systemctl enable --now "gre-watch@$DEV" > /dev/null 2>&1
+  systemctl enable --now "gre@$DEV" >/dev/null 2>&1
+  systemctl enable --now "gre-watch@$DEV" >/dev/null 2>&1
 
-  log_message "$TUNNEL_TYPE tunnel $DEV created: LOCAL=$LOCAL_IP ($LOCAL_COUNTRY), REMOTE=$REMOTE_IP ($REMOTE_COUNTRY), TUN=$TUN_IP"
-  
   echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
-  echo -e "${GREEN}✓ $TUNNEL_TYPE Tunnel $DEV created successfully!${RESET}"
+  echo -e "${GREEN}✓ $TUNNEL_TYPE tunnel $DEV created successfully!${RESET}"
   echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
   
-  echo -e "${BLUE}Configuration Summary:${RESET}"
-  echo -e "  Tunnel name: ${GREEN}$DEV${RESET}"
-  echo -e "  Tunnel type: ${CYAN}$TUNNEL_TYPE${RESET}"
-  echo -e "  Local public IP: ${YELLOW}$LOCAL_IP${RESET}"
-  echo -e "  Remote public IP: ${YELLOW}$REMOTE_IP${RESET}"
-  echo -e "  Your tunnel IP: ${GREEN}$TUN_IP${RESET}"
-  echo -e "  Ping target: ${CYAN}$PING_TARGET${RESET}"
+  echo -e "Check status: ${GREEN}systemctl status gre@$DEV${RESET}"
+  echo -e "Test connection: ${GREEN}ping $PING_TARGET${RESET}"
   
-  if [ "$TUNNEL_TYPE" = "sit" ]; then
-    echo -e "\n${MAGENTA}Additional SIT Tunnel Information:${RESET}"
-    echo -e "  SIT (Simple Internet Transition) tunnels carry IPv6 traffic over IPv4"
-    echo -e "  After tunnel is up, you can assign IPv6 addresses to the interface"
-    echo -e "  Example IPv6 address: 2001:db8::1/64"
-    echo -e "  Enable IPv6: echo 1 > /proc/sys/net/ipv6/conf/$DEV/accept_ra"
-  fi
-  
-  echo -e "\n${YELLOW}Management commands:${RESET}"
-  echo -e "  Check status: ${GREEN}systemctl status gre@$DEV${RESET}"
-  echo -e "  Stop tunnel: ${RED}systemctl stop gre@$DEV gre-watch@$DEV${RESET}"
-  echo -e "  View logs: ${BLUE}journalctl -u gre@$DEV${RESET}"
-  echo -e "  View interface: ${CYAN}ip addr show $DEV${RESET}"
-  
-  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
-  pause
-}
-
-# ... باقی توابع (list_all_tunnels, delete_tunnel, status_tunnels, show_help) همانند قبل باقی می‌مانند
-# فقط show_help را به روز می‌کنم:
-
-show_help() {
-  show_banner
-  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
-  echo -e "${GREEN}                      HELP & GUIDE                          ${RESET}"
-  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
-  
-  echo -e "${BLUE}📖 What is GRE/SIT Tunnel?${RESET}"
-  echo "GRE (Generic Routing Encapsulation): IPv4 over IPv4 tunneling"
-  echo "SIT (Simple Internet Transition): IPv6 over IPv4 tunneling"
-  echo
-  
-  echo -e "${GREEN}🚀 Features:${RESET}"
-  echo "• Automatic IP detection from multiple services"
-  echo "• Country detection for smart IP assignment"
-  echo "• Support for both GRE and SIT tunnels"
-  echo "• Iran server: Gets .1 address (e.g., 192.168.100.1)"
-  echo "• Foreign server: Gets .2 address (e.g., 192.168.100.2)"
-  echo "• Automatic ping target suggestion"
-  echo
-  
-  echo -e "${MAGENTA}🎯 IP Assignment Rules:${RESET}"
-  echo "• GRE Tunnel: Uses 192.168.100.x - 192.168.200.x range"
-  echo "• SIT Tunnel: Uses 192.168.150.x range (different from GRE)"
-  echo "• Iran Server: Always gets .1 address"
-  echo "• Foreign Server: Always gets .2 address"
-  echo "• /30 subnet recommended (2 usable IPs)"
-  echo
-  
-  echo -e "${YELLOW}📋 SIT Tunnel Specifics:${RESET}"
-  echo "• SIT tunnels encapsulate IPv6 traffic over IPv4"
-  echo "• IPv4 addresses are used for tunnel endpoints"
-  echo "• IPv6 addresses can be assigned separately"
-  echo "• Requires IPv6 support in kernel"
-  echo
-  
-  echo -e "${CYAN}📋 Manual Management Commands:${RESET}"
-  echo -e "  ${GREEN}List all tunnels:${RESET} ip link show | grep -E '(gre|sit)'"
-  echo -e "  ${GREEN}Check status:${RESET} systemctl status gre@tunnel_name"
-  echo -e "  ${GREEN}Start tunnel:${RESET} systemctl start gre@tunnel_name"
-  echo -e "  ${GREEN}Stop tunnel:${RESET} systemctl stop gre@tunnel_name gre-watch@tunnel_name"
-  echo -e "  ${GREEN}View logs:${RESET} journalctl -u gre@tunnel_name -f"
-  echo -e "  ${GREEN}View config:${RESET} cat /etc/gre/tunnel_name.conf"
-  echo
-  
-  echo -e "${BLUE}💡 Tips:${RESET}"
-  echo "• Port 47 (GRE) must be open in firewall"
-  echo "• SIT tunnels require IPv6 kernel modules"
-  echo "• Use /30 subnet for point-to-point tunnels"
-  echo "• Test connectivity with ping before using"
-  echo -e "${MAGENTA}Created by: Parsa${RESET}"
-  echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
   pause
 }
 
@@ -636,15 +799,14 @@ while true; do
   echo -e "${GREEN}                      MAIN MENU                             ${RESET}"
   echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
   
-  echo -e "${GREEN}  1) 🚀 Create new tunnel (GRE/SIT)${RESET}"
+  echo -e "${GREEN}  1) 🚀 Create new tunnel${RESET}"
   echo -e "${RED}  2) 🗑️  Delete tunnel${RESET}"
   echo -e "${BLUE}  3) 📊 Tunnel status${RESET}"
-  echo -e "${MAGENTA}  4) 🔍 List all tunnel interfaces${RESET}"
-  echo -e "${YELLOW}  5) ❓ Help & Guide${RESET}"
-  echo -e "${WHITE}  6) 🚪 Exit menu${RESET}"
+  echo -e "${MAGENTA}  4) 🔍 List all tunnels${RESET}"
+  echo -e "${YELLOW}  5) 🚪 Exit${RESET}"
   echo
   echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
-  read -rp "Select option [1-6]: " opt
+  read -rp "Select option [1-5]: " opt
 
   case "$opt" in
     1) create_tunnel ;;
@@ -655,25 +817,13 @@ while true; do
       list_all_tunnels
       pause
       ;;
-    5) show_help ;;
-    6) 
-      show_banner
-      echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
-      echo -e "${GREEN}                     GOODBYE!                              ${RESET}"
-      echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
-      echo -e "${GREEN}✅ Tunnels continue running in background.${RESET}"
-      echo -e "${BLUE}📋 To manage tunnels later:${RESET}"
-      echo -e "   Run this script again: ${CYAN}$0${RESET}"
-      echo -e "   Or use systemctl commands"
-      echo
-      echo -e "${MAGENTA}🔗 Created by: Parsa${RESET}"
-      echo -e "${MAGENTA}🔗 Stay connected!${RESET}\n"
-      echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    5) 
+      echo -e "\n${GREEN}Goodbye!${RESET}"
       exit 0
       ;;
     *) 
-      echo -e "\n${RED}✗ Invalid option! Please select 1-6${RESET}"
-      sleep 2
+      echo -e "\n${RED}Invalid option!${RESET}"
+      sleep 1
       ;;
   esac
 done
