@@ -1,5 +1,4 @@
-# نصب‌کننده خودکار GRE
-ابزار نصب محیط آزمون GRE
+
 # 🌐 GRE Tunnel Auto Installer
 
 یک اسکریپت ساده و قدرتمند برای راه‌اندازی تونل GRE بین دو سرور
@@ -15,32 +14,3 @@
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/parsafeiz/gre-auto-installer/main/gre-installer.sh)
-
-# اجرای دستور نصب
-bash <(curl -s https://raw.githubusercontent.com/parsafeiz/gre-auto-installer/main/gre-installer.sh)
-
-# انتخاب گزینه 2 (خارج)
-# وارد کردن IP عمومی سرور خارج
-# وارد کردن IP عمومی سرور ایران
-
-
-# بررسی وضعیت تونل
-systemctl status gre
-
-# راه‌اندازی مجدد تونل
-systemctl restart gre
-
-# مشاهده لاگ‌ها
-tail -f /var/log/gre-watch.log
-
-# تست دستی
-/usr/local/bin/gre.sh status
-
-
-
-# ویرایش فایل تنظیمات
-nano /usr/local/bin/gre.sh
-
-
-
-
