@@ -99,7 +99,7 @@ detect_server_ip() {
   fi
   
   # چهارم: بررسی ens3, enp0s3, etc
-  for iface in $(ip link show | grep -oE '^[0-9]+: [a-z0-9]+:' | awk '{print $2}' | tr -d ':' | grep -E '^(eth|enp|ens|eno)' | head -1); do
+  for iface in $(ip link show 2>/dev/null | grep -oE '^[0-9]+: [a-z0-9]+:' | awk '{print $2}' | tr -d ':' | grep -E '^(eth|enp|ens|eno)' | head -1); do
     ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
     if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
       echo "$ip"
@@ -136,9 +136,12 @@ suggest_gre_ip() {
   # پیدا کردن subnet آزاد برای GRE
   for i in {100..200}; do
     local config_exists=false
-    for conf in "$CONFIG_DIR"/*.conf 2>/dev/null; do
-      [ -f "$conf" ] && grep -q "192\.168\.$i\." "$conf" && config_exists=true
-    done
+    # اصلاح شده: بررسی فایل‌های config
+    if ls "$CONFIG_DIR"/*.conf 1>/dev/null 2>&1; then
+      for conf in "$CONFIG_DIR"/*.conf; do
+        [ -f "$conf" ] && grep -q "192\.168\.$i\." "$conf" && config_exists=true
+      done
+    fi
     
     if [ "$config_exists" = false ]; then
       if [ "$country" = "IR" ] || [ "$country" = "Iran" ]; then
@@ -176,9 +179,12 @@ suggest_sit_ipv6() {
     local hex_i=$(printf "%02x" $i)
     local config_exists=false
     
-    for conf in "$CONFIG_DIR"/*.conf 2>/dev/null; do
-      [ -f "$conf" ] && grep -q "fd00:$hex_i:" "$conf" && config_exists=true
-    done
+    # اصلاح شده: بررسی فایل‌های config
+    if ls "$CONFIG_DIR"/*.conf 1>/dev/null 2>&1; then
+      for conf in "$CONFIG_DIR"/*.conf; do
+        [ -f "$conf" ] && grep -q "fd00:$hex_i:" "$conf" && config_exists=true
+      done
+    fi
     
     if [ "$config_exists" = false ]; then
       if [ "$country" = "IR" ] || [ "$country" = "Iran" ]; then
@@ -241,36 +247,39 @@ list_all_tunnels() {
   done
   
   # نمایش تونل‌های config شده اما غیرفعال
-  shopt -s nullglob
-  for conf in "$CONFIG_DIR"/*.conf; do
-    local dev=$(basename "$conf" .conf)
-    
-    # اگر اینترفیس فعال نیست
-    if ! ip link show "$dev" &>/dev/null; then
-      found=1
-      local tunnel_type="gre"
-      local ip=""
-      local local_ip=""
-      local remote_ip=""
+  local conf_files
+  conf_files=$(ls "$CONFIG_DIR"/*.conf 2>/dev/null) || true
+  
+  if [ -n "$conf_files" ]; then
+    for conf in $conf_files; do
+      local dev=$(basename "$conf" .conf)
       
-      # خواندن اطلاعات از config
-      while IFS='=' read -r key value; do
-        case "$key" in
-          TUNNEL_TYPE) tunnel_type="$value" ;;
-          TUN_IP) ip="$value" ;;
-          LOCAL_IP) local_ip="$value" ;;
-          REMOTE_IP) remote_ip="$value" ;;
-        esac
-      done < "$conf"
-      
-      if [ "$tunnel_type" = "sit" ]; then
-        echo -e "${YELLOW}● SIT  $dev${RESET}  state DOWN  IPv6: ${ip:-"Unknown"}  Remote: ${remote_ip:-"Unknown"}"
-      else
-        echo -e "${YELLOW}● GRE  $dev${RESET}  state DOWN  IP: ${ip:-"Unknown"}  Remote: ${remote_ip:-"Unknown"}"
+      # اگر اینترفیس فعال نیست
+      if ! ip link show "$dev" &>/dev/null; then
+        found=1
+        local tunnel_type="gre"
+        local ip=""
+        local local_ip=""
+        local remote_ip=""
+        
+        # خواندن اطلاعات از config
+        while IFS='=' read -r key value; do
+          case "$key" in
+            TUNNEL_TYPE) tunnel_type="$value" ;;
+            TUN_IP) ip="$value" ;;
+            LOCAL_IP) local_ip="$value" ;;
+            REMOTE_IP) remote_ip="$value" ;;
+          esac
+        done < "$conf"
+        
+        if [ "$tunnel_type" = "sit" ]; then
+          echo -e "${YELLOW}● SIT  $dev${RESET}  state DOWN  IPv6: ${ip:-"Unknown"}  Remote: ${remote_ip:-"Unknown"}"
+        else
+          echo -e "${YELLOW}● GRE  $dev${RESET}  state DOWN  IP: ${ip:-"Unknown"}  Remote: ${remote_ip:-"Unknown"}"
+        fi
       fi
-    fi
-  done
-  shopt -u nullglob
+    done
+  fi
   
   if [ $found -eq 0 ]; then
     echo -e "${YELLOW}No tunnel interfaces found${RESET}"
@@ -290,9 +299,13 @@ delete_tunnel() {
   
   echo -e "\n${YELLOW}=== Configured Tunnels ===${RESET}"
   
-  shopt -s nullglob
-  local CONFS=("$CONFIG_DIR"/*.conf)
-  shopt -u nullglob
+  # لیست فایل‌های config
+  local CONFS=()
+  if ls "$CONFIG_DIR"/*.conf 1>/dev/null 2>&1; then
+    for conf in "$CONFIG_DIR"/*.conf; do
+      CONFS+=("$conf")
+    done
+  fi
   
   if [ ${#CONFS[@]} -eq 0 ]; then
     echo -e "\n${RED}No tunnel configurations found!${RESET}"
@@ -416,87 +429,92 @@ status_tunnels() {
   echo -e "\n${YELLOW}=== Detailed Status ===${RESET}"
   echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
   
-  shopt -s nullglob
   local found=0
   local total_up=0
   local total_down=0
   
-  for c in "$CONFIG_DIR"/*.conf; do
-    found=1
-    
-    # خواندن config
-    local DEV="" PING_TARGET="" TUN_IP="" LOCAL_IP="" REMOTE_IP="" TUNNEL_TYPE="" LOCAL_COUNTRY=""
-    while IFS='=' read -r key value; do
-      case "$key" in
-        DEV) DEV="$value" ;;
-        PING_TARGET) PING_TARGET="$value" ;;
-        TUN_IP) TUN_IP="$value" ;;
-        LOCAL_IP) LOCAL_IP="$value" ;;
-        REMOTE_IP) REMOTE_IP="$value" ;;
-        TUNNEL_TYPE) TUNNEL_TYPE="$value" ;;
-        LOCAL_COUNTRY) LOCAL_COUNTRY="$value" ;;
-      esac
-    done < "$c"
-    
-    # تعیین رنگ و نماد
-    local type_color=$BLUE
-    local type_symbol="🌉"
-    if [ "$TUNNEL_TYPE" = "sit" ]; then
-      type_color=$CYAN
-      type_symbol="🔗"
-    fi
-    
-    # بررسی وضعیت
-    if ip link show "$DEV" &>/dev/null; then
+  # لیست فایل‌های config
+  local conf_files
+  conf_files=$(ls "$CONFIG_DIR"/*.conf 2>/dev/null) || true
+  
+  if [ -n "$conf_files" ]; then
+    for c in $conf_files; do
+      found=1
+      
+      # خواندن config
+      local DEV="" PING_TARGET="" TUN_IP="" LOCAL_IP="" REMOTE_IP="" TUNNEL_TYPE="" LOCAL_COUNTRY=""
+      while IFS='=' read -r key value; do
+        case "$key" in
+          DEV) DEV="$value" ;;
+          PING_TARGET) PING_TARGET="$value" ;;
+          TUN_IP) TUN_IP="$value" ;;
+          LOCAL_IP) LOCAL_IP="$value" ;;
+          REMOTE_IP) REMOTE_IP="$value" ;;
+          TUNNEL_TYPE) TUNNEL_TYPE="$value" ;;
+          LOCAL_COUNTRY) LOCAL_COUNTRY="$value" ;;
+        esac
+      done < "$c"
+      
+      # تعیین رنگ و نماد
+      local type_color=$BLUE
+      local type_symbol="🌉"
       if [ "$TUNNEL_TYPE" = "sit" ]; then
-        # برای SIT از ping6 استفاده کن
-        if ping6 -c1 -W1 "$PING_TARGET" >/dev/null 2>&1; then
-          echo -e "${GREEN}✅${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${GREEN}$DEV${RESET}"
-          echo -e "   Status: ${GREEN}UP${RESET} $type_symbol"
-          echo -e "   Tunnel IPv6: ${BLUE}$TUN_IP${RESET}"
-          echo -e "   Local IPv4: ${CYAN}$LOCAL_IP${RESET}"
-          echo -e "   Remote IPv4: ${CYAN}$REMOTE_IP${RESET}"
-          echo -e "   Ping: ${GREEN}Success ✓${RESET}"
-          ((total_up++))
+        type_color=$CYAN
+        type_symbol="🔗"
+      fi
+      
+      # بررسی وضعیت
+      if ip link show "$DEV" &>/dev/null; then
+        if [ "$TUNNEL_TYPE" = "sit" ]; then
+          # برای SIT از ping6 استفاده کن
+          if ping6 -c1 -W1 "$PING_TARGET" >/dev/null 2>&1; then
+            echo -e "${GREEN}✅${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${GREEN}$DEV${RESET}"
+            echo -e "   Status: ${GREEN}UP${RESET} $type_symbol"
+            echo -e "   Tunnel IPv6: ${BLUE}$TUN_IP${RESET}"
+            echo -e "   Local IPv4: ${CYAN}$LOCAL_IP${RESET}"
+            echo -e "   Remote IPv4: ${CYAN}$REMOTE_IP${RESET}"
+            echo -e "   Ping: ${GREEN}Success ✓${RESET}"
+            ((total_up++))
+          else
+            echo -e "${YELLOW}⚠${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${YELLOW}$DEV${RESET}"
+            echo -e "   Status: ${YELLOW}UP (ping failed)${RESET} $type_symbol"
+            echo -e "   Tunnel IPv6: ${BLUE}$TUN_IP${RESET}"
+            echo -e "   Local IPv4: ${CYAN}$LOCAL_IP${RESET}"
+            echo -e "   Remote IPv4: ${CYAN}$REMOTE_IP${RESET}"
+            echo -e "   Ping: ${RED}Failed ✗${RESET}"
+            ((total_down++))
+          fi
         else
-          echo -e "${YELLOW}⚠${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${YELLOW}$DEV${RESET}"
-          echo -e "   Status: ${YELLOW}UP (ping failed)${RESET} $type_symbol"
-          echo -e "   Tunnel IPv6: ${BLUE}$TUN_IP${RESET}"
-          echo -e "   Local IPv4: ${CYAN}$LOCAL_IP${RESET}"
-          echo -e "   Remote IPv4: ${CYAN}$REMOTE_IP${RESET}"
-          echo -e "   Ping: ${RED}Failed ✗${RESET}"
-          ((total_down++))
+          # برای GRE از ping معمولی استفاده کن
+          if ping -c1 -W1 "$PING_TARGET" >/dev/null 2>&1; then
+            echo -e "${GREEN}✅${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${GREEN}$DEV${RESET}"
+            echo -e "   Status: ${GREEN}UP${RESET} $type_symbol"
+            echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
+            echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
+            echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
+            echo -e "   Ping: ${GREEN}Success ✓${RESET}"
+            ((total_up++))
+          else
+            echo -e "${YELLOW}⚠${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${YELLOW}$DEV${RESET}"
+            echo -e "   Status: ${YELLOW}UP (ping failed)${RESET} $type_symbol"
+            echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
+            echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
+            echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
+            echo -e "   Ping: ${RED}Failed ✗${RESET}"
+            ((total_down++))
+          fi
         fi
       else
-        # برای GRE از ping معمولی استفاده کن
-        if ping -c1 -W1 "$PING_TARGET" >/dev/null 2>&1; then
-          echo -e "${GREEN}✅${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${GREEN}$DEV${RESET}"
-          echo -e "   Status: ${GREEN}UP${RESET} $type_symbol"
-          echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
-          echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
-          echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
-          echo -e "   Ping: ${GREEN}Success ✓${RESET}"
-          ((total_up++))
-        else
-          echo -e "${YELLOW}⚠${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${YELLOW}$DEV${RESET}"
-          echo -e "   Status: ${YELLOW}UP (ping failed)${RESET} $type_symbol"
-          echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
-          echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
-          echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
-          echo -e "   Ping: ${RED}Failed ✗${RESET}"
-          ((total_down++))
-        fi
+        echo -e "${RED}❌${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${RED}$DEV${RESET}"
+        echo -e "   Status: ${RED}DOWN${RESET} $type_symbol"
+        echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
+        echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
+        echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
+        ((total_down++))
       fi
-    else
-      echo -e "${RED}❌${RESET} ${type_color}$TUNNEL_TYPE${RESET} ${RED}$DEV${RESET}"
-      echo -e "   Status: ${RED}DOWN${RESET} $type_symbol"
-      echo -e "   Tunnel IP: ${BLUE}$TUN_IP${RESET}"
-      echo -e "   Local IP: ${CYAN}$LOCAL_IP${RESET}"
-      echo -e "   Remote IP: ${CYAN}$REMOTE_IP${RESET}"
-      ((total_down++))
-    fi
-    echo
-  done
+      echo
+    done
+  fi
   
   [ "$found" -eq 0 ] && echo -e "${YELLOW}No tunnel configurations found${RESET}"
   
