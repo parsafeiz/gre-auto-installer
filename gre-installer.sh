@@ -91,6 +91,45 @@ validate_ipv6() {
   return 1
 }
 
+# Check if kernel modules are loaded
+check_kernel_modules() {
+  local tunnel_type="$1"
+  
+  if [ "$tunnel_type" = "sit" ]; then
+    if ! lsmod | grep -q "sit" && ! lsmod | grep -q "ip_tunnel"; then
+      echo -e "${YELLOW}Loading SIT kernel modules...${RESET}"
+      modprobe ip_tunnel 2>/dev/null
+      modprobe sit 2>/dev/null
+    fi
+  else
+    if ! lsmod | grep -q "ip_gre"; then
+      echo -e "${YELLOW}Loading GRE kernel modules...${RESET}"
+      modprobe ip_gre 2>/dev/null
+    fi
+  fi
+}
+
+# Enable IP forwarding
+enable_ip_forwarding() {
+  # Enable IPv4 forwarding
+  if [ "$(sysctl -n net.ipv4.ip_forward)" -eq 0 ]; then
+    echo -e "${YELLOW}Enabling IPv4 forwarding...${RESET}"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-gre-forwarding.conf
+  fi
+  
+  # Enable IPv6 forwarding if SIT tunnels exist
+  if ls "$CONFIG_DIR"/*.conf 2>/dev/null | grep -q "sit" || [ "$1" = "sit" ]; then
+    if [ "$(sysctl -n net.ipv6.conf.all.forwarding)" -eq 0 ]; then
+      echo -e "${YELLOW}Enabling IPv6 forwarding...${RESET}"
+      sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+      echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-gre-forwarding.conf
+    fi
+  fi
+  
+  sysctl -p /etc/sysctl.d/99-gre-forwarding.conf 2>/dev/null
+}
+
 # Find next available tunnel name
 next_tunnel_name() {
   local tunnel_type="$1"
@@ -325,6 +364,63 @@ list_all_tunnels() {
   fi
   
   echo -e "=========================================================="
+}
+
+# Function to start/stop tunnel manually
+manage_tunnel() {
+  local action="$1"  # start or stop
+  local DEV="$2"
+  
+  if [ ! -f "$CONFIG_DIR/$DEV.conf" ]; then
+    echo -e "${RED}Configuration file for $DEV not found!${RESET}"
+    return 1
+  fi
+  
+  # Read tunnel type
+  local TUNNEL_TYPE="gre"
+  if [ -f "$CONFIG_DIR/$DEV.conf" ]; then
+    TUNNEL_TYPE=$(grep '^TUNNEL_TYPE=' "$CONFIG_DIR/$DEV.conf" | cut -d'=' -f2)
+  fi
+  
+  echo -e "${YELLOW}${action^}ing $TUNNEL_TYPE tunnel $DEV...${RESET}"
+  
+  # Load kernel modules
+  check_kernel_modules "$TUNNEL_TYPE"
+  
+  # Enable IP forwarding
+  enable_ip_forwarding "$TUNNEL_TYPE"
+  
+  # Execute script
+  if [ -f "$SCRIPT" ]; then
+    "$SCRIPT" "$action" "$DEV"
+    
+    if [ "$action" = "start" ]; then
+      # Start watchdog service
+      systemctl start "gre-watch@$DEV" 2>/dev/null
+      echo -e "${GREEN}✓ Tunnel $DEV started${RESET}"
+    else
+      # Stop watchdog service
+      systemctl stop "gre-watch@$DEV" 2>/dev/null
+      echo -e "${YELLOW}✓ Tunnel $DEV stopped${RESET}"
+    fi
+  else
+    echo -e "${RED}Runtime script not found!${RESET}"
+    return 1
+  fi
+  
+  sleep 1
+  return 0
+}
+
+# Function to restart tunnel
+restart_tunnel() {
+  local DEV="$1"
+  
+  echo -e "${YELLOW}Restarting tunnel $DEV...${RESET}"
+  manage_tunnel "stop" "$DEV"
+  sleep 2
+  manage_tunnel "start" "$DEV"
+  echo -e "${GREEN}✓ Tunnel $DEV restarted${RESET}"
 }
 
 delete_tunnel() {
@@ -570,6 +666,127 @@ status_tunnels() {
   pause
 }
 
+# Tunnel management menu
+manage_tunnel_menu() {
+  show_banner
+  echo -e "=========================================================="
+  echo -e "${WHITE}                TUNNEL MANAGEMENT                  ${RESET}"
+  echo -e "=========================================================="
+  
+  # List config files
+  local CONFS=()
+  if ls "$CONFIG_DIR"/*.conf 1>/dev/null 2>&1; then
+    for conf in "$CONFIG_DIR"/*.conf; do
+      CONFS+=("$conf")
+    done
+  fi
+  
+  if [ ${#CONFS[@]} -eq 0 ]; then
+    echo -e "\n${RED}No tunnel configurations found!${RESET}"
+    pause
+    return 1
+  fi
+  
+  echo -e "\n${WHITE}Select tunnel to manage:${RESET}"
+  echo -e "=========================================================="
+  
+  local i=1
+  for conf in "${CONFS[@]}"; do
+    local dev=$(basename "$conf" .conf)
+    local tunnel_type="gre"
+    local local_ip=""
+    local remote_ip=""
+    
+    # Read info from config
+    while IFS='=' read -r key value; do
+      case "$key" in
+        TUNNEL_TYPE) tunnel_type="$value" ;;
+        LOCAL_IP) local_ip="$value" ;;
+        REMOTE_IP) remote_ip="$value" ;;
+      esac
+    done < "$conf"
+    
+    if ip link show "$dev" &>/dev/null; then
+      echo -e "${GREEN}$i) $tunnel_type $dev${RESET} - ${WHITE}${local_ip} -> ${remote_ip}${RESET} (UP)"
+    else
+      echo -e "${RED}$i) $tunnel_type $dev${RESET} - ${WHITE}${local_ip} -> ${remote_ip}${RESET} (DOWN)"
+    fi
+    ((i++))
+  done
+  
+  echo -e "$i) Back to main menu"
+  echo -e "=========================================================="
+  
+  read -rp "Select tunnel number [1-$i]: " selection
+  
+  # Validate selection
+  if [[ ! "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt $i ]; then
+    echo -e "${RED}Invalid selection!${RESET}"
+    pause
+    return 1
+  fi
+  
+  # If Back selected
+  if [ "$selection" -eq $i ]; then
+    return 0
+  fi
+  
+  local conf="${CONFS[$((selection-1))]}"
+  local DEV=$(basename "$conf" .conf)
+  
+  # Read tunnel type
+  local TUNNEL_TYPE="gre"
+  if [ -f "$conf" ]; then
+    TUNNEL_TYPE=$(grep '^TUNNEL_TYPE=' "$conf" | cut -d'=' -f2)
+  fi
+  
+  # Check current status
+  local is_up=false
+  if ip link show "$DEV" &>/dev/null; then
+    is_up=true
+  fi
+  
+  echo -e "\n${WHITE}Selected tunnel: $TUNNEL_TYPE $DEV${RESET}"
+  echo -e "Current status: $([ "$is_up" = true ] && echo -e "${GREEN}UP${RESET}" || echo -e "${RED}DOWN${RESET}")"
+  echo -e "\n${WHITE}Select action:${RESET}"
+  echo "1) Start tunnel"
+  echo "2) Stop tunnel"
+  echo "3) Restart tunnel"
+  echo "4) Check status"
+  echo "5) Back"
+  
+  read -rp "Enter choice [1-5]: " action_choice
+  
+  case "$action_choice" in
+    1)
+      manage_tunnel "start" "$DEV"
+      ;;
+    2)
+      manage_tunnel "stop" "$DEV"
+      ;;
+    3)
+      restart_tunnel "$DEV"
+      ;;
+    4)
+      echo -e "\n${WHITE}Checking status of $DEV...${RESET}"
+      if [ -f "$SCRIPT" ]; then
+        "$SCRIPT" "status" "$DEV"
+      else
+        echo -e "${RED}Runtime script not found!${RESET}"
+      fi
+      ;;
+    5)
+      return 0
+      ;;
+    *)
+      echo -e "${RED}Invalid choice!${RESET}"
+      ;;
+  esac
+  
+  pause
+  return 0
+}
+
 # ---------- GRE/SIT Runtime Script ----------
 
 create_or_update_gre_script() {
@@ -598,8 +815,10 @@ done < "$CONF"
 if [ "$TUNNEL_TYPE" = "sit" ]; then
   modprobe ip_tunnel 2>/dev/null
   modprobe sit 2>/dev/null
+  echo "Loaded SIT tunnel modules"
 else
   modprobe ip_gre 2>/dev/null
+  echo "Loaded GRE tunnel modules"
 fi
 
 # Enable IP forwarding
@@ -639,13 +858,19 @@ case "$1" in
     
     ip link set "$DEV" up
     echo "$TUNNEL_TYPE tunnel $DEV started with IP $TUN_IP"
+    
+    # Show interface details
+    echo "Interface details:"
+    ip addr show dev "$DEV" 2>/dev/null || ip -6 addr show dev "$DEV" 2>/dev/null
     ;;
   stop)
     echo "Stopping tunnel $DEV"
     ip link set "$DEV" down 2>/dev/null
     ip tunnel del "$DEV" 2>/dev/null
+    echo "Tunnel $DEV stopped"
     ;;
   restart)
+    echo "Restarting tunnel $DEV"
     "$0" stop "$DEV"
     sleep 1
     "$0" start "$DEV"
@@ -742,8 +967,13 @@ create_tunnel() {
   echo -e "${WHITE}                    CREATE NEW TUNNEL                ${RESET}"
   echo -e "=========================================================="
   
+  # Pre-flight checks
+  echo -e "${YELLOW}Performing system checks...${RESET}"
+  check_kernel_modules "gre"
+  enable_ip_forwarding
+  
   # Select tunnel type
-  echo -e "${WHITE}Select tunnel type:${RESET}"
+  echo -e "\n${WHITE}Select tunnel type:${RESET}"
   echo "1) GRE Tunnel - IPv4 over IPv4 (Recommended)"
   echo "2) SIT Tunnel - IPv6 over IPv4"
   read -rp "Enter choice [1-2, default=1]: " tunnel_choice
@@ -895,22 +1125,35 @@ EOF
 
   echo -e "\n${YELLOW}Starting tunnel...${RESET}"
   systemctl daemon-reload
+  
+  # Enable and start services
   systemctl enable --now "gre@$DEV" >/dev/null 2>&1
   systemctl enable --now "gre-watch@$DEV" >/dev/null 2>&1
+  
+  # Manually start tunnel to ensure it's up
+  sleep 2
+  manage_tunnel "start" "$DEV"
 
   echo -e "=========================================================="
   echo -e "${GREEN}✓ $TUNNEL_TYPE tunnel $DEV created successfully!${RESET}"
   echo -e "=========================================================="
   
+  # Show current status
+  echo -e "\n${WHITE}Current tunnel status:${RESET}"
+  if [ -f "$SCRIPT" ]; then
+    "$SCRIPT" "status" "$DEV"
+  fi
+  
   if [ "$TUNNEL_TYPE" = "gre" ]; then
-    echo -e "Tunnel IP: ${WHITE}$TUN_IP/30${RESET}"
+    echo -e "\nTunnel IP: ${WHITE}$TUN_IP/30${RESET}"
     echo -e "Test connection: ${WHITE}ping $PING_TARGET${RESET}"
   else
-    echo -e "Tunnel IPv6: ${WHITE}$TUN_IP${RESET}"
+    echo -e "\nTunnel IPv6: ${WHITE}$TUN_IP${RESET}"
     echo -e "Test connection: ${WHITE}ping6 $PING_TARGET${RESET}"
   fi
   
   echo -e "Check status: ${WHITE}systemctl status gre@$DEV${RESET}"
+  echo -e "Manage tunnel: Run this script and select option 2${RESET}"
   
   pause
 }
@@ -924,24 +1167,26 @@ while true; do
   echo -e "=========================================================="
   
   echo -e "${WHITE}  1) Create new tunnel${RESET}"
-  echo -e "${WHITE}  2) Delete tunnel${RESET}"
-  echo -e "${WHITE}  3) Tunnel status${RESET}"
-  echo -e "${WHITE}  4) List all tunnels${RESET}"
-  echo -e "${WHITE}  5) Exit${RESET}"
+  echo -e "${WHITE}  2) Manage tunnels (Start/Stop/Restart)${RESET}"
+  echo -e "${WHITE}  3) Delete tunnel${RESET}"
+  echo -e "${WHITE}  4) Tunnel status${RESET}"
+  echo -e "${WHITE}  5) List all tunnels${RESET}"
+  echo -e "${WHITE}  6) Exit${RESET}"
   echo
   echo -e "=========================================================="
-  read -rp "Select option [1-5]: " opt
+  read -rp "Select option [1-6]: " opt
 
   case "$opt" in
     1) create_tunnel ;;
-    2) delete_tunnel ;;
-    3) status_tunnels ;;
-    4) 
+    2) manage_tunnel_menu ;;
+    3) delete_tunnel ;;
+    4) status_tunnels ;;
+    5) 
       show_banner
       list_all_tunnels
       pause
       ;;
-    5) 
+    6) 
       echo -e "\n${WHITE}Goodbye!${RESET}"
       exit 0
       ;;
