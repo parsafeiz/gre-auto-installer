@@ -14,3 +14,15 @@
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/parsafeiz/gre-auto-installer/main/gre-installer.sh)
+
+# بررسی وضعیت تونل
+systemctl status gre
+
+# راه‌اندازی مجدد تونل
+systemctl restart gre
+
+# مشاهده لاگ‌ها
+tail -f /var/log/gre-watch.log
+
+# تست دستی
+/usr/local/bin/gre.sh status
