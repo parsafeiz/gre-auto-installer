@@ -42,7 +42,7 @@
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/parsafeiz/gre-auto-installer/main/gre-installer.sh)
-
+##
 1️⃣ نصب پیش‌نیازها <a id="1️⃣-نصب-پیشنیازها"></a>
 
 # Ubuntu/Debian
