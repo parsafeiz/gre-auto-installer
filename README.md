@@ -42,18 +42,11 @@
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/parsafeiz/gre-auto-installer/main/gre-installer.sh)
-##
-1️⃣ نصب پیش‌نیازها <a id="1️⃣-نصب-پیشنیازها"></a>
+### 1️⃣ نصب پیش‌نیازها <a id="1-نصب-پیشنیازها"></a>
 
 # Ubuntu/Debian
 sudo apt update && sudo apt install -y curl iproute2
 
 # CentOS/RHEL
 sudo yum install -y curl iproute
-
-
-# Ubuntu/Debian
-sudo apt update && sudo apt install -y curl iproute2
-
-# CentOS/RHEL
-sudo yum install -y curl iproute
+### 2️⃣ ایجاد اسکریپت GRE <a id="2-ایجاد-اسکریپت-gre"></a>
