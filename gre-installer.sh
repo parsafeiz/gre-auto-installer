@@ -4,14 +4,20 @@ CONFIG_DIR="/etc/gre"
 SCRIPT="/usr/local/bin/gre.sh"
 SERVICE_DIR="/etc/systemd/system"
 
+GREEN="\e[32m"
+RED="\e[31m"
+BLUE="\e[34m"
+WHITE="\e[97m"
+RESET="\e[0m"
+
 mkdir -p "$CONFIG_DIR"
 
-clear
-echo "=============================="
-echo " GRE Tunnel Manager"
-echo "=============================="
-
 # ---------- helpers ----------
+
+pause() {
+  echo
+  read -p "Press Enter to continue..."
+}
 
 next_gre() {
   i=1
@@ -33,6 +39,8 @@ suggest_private_ip() {
     fi
   done
 }
+
+# ---------- gre runtime script ----------
 
 create_gre_script() {
 cat > "$SCRIPT" <<'EOF'
@@ -73,6 +81,8 @@ EOF
 chmod +x "$SCRIPT"
 }
 
+# ---------- services ----------
+
 create_service() {
 DEV="$1"
 
@@ -106,22 +116,11 @@ WantedBy=multi-user.target
 EOF
 }
 
-# ---------- menu actions ----------
+# ---------- actions ----------
 
 create_tunnel() {
   DEV=$(next_gre)
   echo "Creating tunnel: $DEV"
-
-  echo "Server location:"
-  echo "1) iran"
-  echo "2) khareji"
-  read -p "Select: " loc
-
-  case "$loc" in
-    1) SIDE="iran" ;;
-    2) SIDE="khareji" ;;
-    *) echo "Invalid choice"; return ;;
-  esac
 
   AUTO_IP=$(detect_public_ip)
   read -p "Local PUBLIC IP [$AUTO_IP]: " LOCAL_IP
@@ -133,11 +132,7 @@ create_tunnel() {
   read -p "Tunnel IP [$SUGGEST_IP]: " TUN_IP
   TUN_IP=${TUN_IP:-$SUGGEST_IP}
 
-  if [ "$SIDE" = "iran" ]; then
-    PING_TARGET=$(echo "$TUN_IP" | sed 's/.1\/30/.2/')
-  else
-    PING_TARGET=$(echo "$TUN_IP" | sed 's/.2\/30/.1/')
-  fi
+  read -p "Remote PRIVATE IP for ping: " PING_TARGET
 
   cat > "$CONFIG_DIR/$DEV.conf" <<EOF
 DEV=$DEV
@@ -155,36 +150,23 @@ EOF
   systemctl start gre@$DEV gre-watch@$DEV
 
   echo "Tunnel $DEV created"
+  pause
 }
 
 delete_tunnel() {
   CONFS=("$CONFIG_DIR"/*.conf)
-
-  if [ ! -f "${CONFS[0]}" ]; then
-    echo "No tunnels found"
-    return
-  fi
+  [ ! -f "${CONFS[0]}" ] && echo "No tunnels found" && pause && return
 
   echo
-  echo "Installed tunnels:"
   i=1
   for c in "${CONFS[@]}"; do
     echo "$i) $(basename "$c" .conf)"
     ((i++))
   done
   echo "0) Back"
-  echo
 
-  read -p "Select tunnel number to delete: " n
-
-  if [ -z "$n" ] || [ "$n" = "0" ]; then
-    return
-  fi
-
-  if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -ge "$i" ]; then
-    echo "Invalid selection"
-    return
-  fi
+  read -p "Select: " n
+  [ -z "$n" ] || [ "$n" = "0" ] && return
 
   CONF="${CONFS[$((n-1))]}"
   DEV=$(basename "$CONF" .conf)
@@ -199,6 +181,7 @@ delete_tunnel() {
 
   systemctl daemon-reload
   echo "Tunnel $DEV removed"
+  pause
 }
 
 status_tunnels() {
@@ -207,28 +190,22 @@ status_tunnels() {
     [ ! -f "$c" ] && continue
     found=1
     source "$c"
-    if ip link show "$DEV" &>/dev/null; then
-      if ping -c1 -W1 "$PING_TARGET" &>/dev/null; then
-        echo "$DEV : UP"
-      else
-        echo "$DEV : NO TRAFFIC"
-      fi
-    else
-      echo "$DEV : DOWN"
-    fi
+    ping -c1 -W1 "$PING_TARGET" &>/dev/null \
+      && echo "$DEV : UP" \
+      || echo "$DEV : DOWN"
   done
-
   [ "$found" -eq 0 ] && echo "No tunnels found"
+  pause
 }
 
-# ---------- main loop ----------
+# ---------- menu ----------
 
 while true; do
   echo
-  echo "1) Create new tunnel"
-  echo "2) Delete tunnel"
-  echo "3) Tunnel status"
-  echo "4) Exit"
+  echo -e "${GREEN}1) Create new tunnel${RESET}"
+  echo -e "${RED}2) Delete tunnel${RESET}"
+  echo -e "${BLUE}3) Tunnel status${RESET}"
+  echo -e "${WHITE}4) Exit${RESET}"
   read -p "Select option: " opt
 
   case "$opt" in
@@ -236,6 +213,5 @@ while true; do
     2) delete_tunnel ;;
     3) status_tunnels ;;
     4) exit 0 ;;
-    *) echo "Invalid option" ;;
   esac
 done
