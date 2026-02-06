@@ -17,8 +17,8 @@ RESET="\e[0m"
 
 # Create directories and log file
 mkdir -p "$CONFIG_DIR"
-touch "$LOG_FILE"
-touch "$WATCH_LOG"
+touch "$LOG_FILE" 2>/dev/null || true
+touch "$WATCH_LOG" 2>/dev/null || true
 
 # ---------- Display Banner ----------
 
@@ -33,7 +33,7 @@ show_banner() {
   echo " | |__| | | \ \| |____     | |  | |\  | |___| | |  __/  "
   echo "  \_____|_|  \_\______|    |_|  |_| \_|_____|_|_|\___|  "
   echo "                                                        "
-  echo "           GRE/SIT Tunnel Manager v3.1                 "
+  echo "           GRE/SIT Tunnel Manager v3.2                 "
   echo "           Auto-Recovery Tunnel System                "
   echo "           Created by: Parsa                           "
   echo "=========================================================="
@@ -61,35 +61,84 @@ configure_firewall() {
   
   echo -e "${YELLOW}Configuring firewall rules...${RESET}"
   
-  # Save current iptables rules
-  iptables-save > /etc/iptables.rules.bak 2>/dev/null
-  ip6tables-save > /etc/ip6tables.rules.bak 2>/dev/null
+  # Check if iptables command exists
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚠ iptables command not found, skipping firewall rules${RESET}"
+    return 0
+  fi
+  
+  # Create iptables directory if it doesn't exist
+  mkdir -p /etc/iptables 2>/dev/null || {
+    echo -e "${YELLOW}⚠ Could not create /etc/iptables directory${RESET}"
+  }
   
   # Add GRE protocol rules
-  if ! iptables -C INPUT -p gre -j ACCEPT 2>/dev/null; then
-    iptables -A INPUT -p gre -j ACCEPT
-    echo -e "${GREEN}✓ Added iptables rule: ACCEPT GRE protocol${RESET}"
+  echo -e "${WHITE}Adding GRE firewall rules...${RESET}"
+  if iptables -C INPUT -p gre -j ACCEPT 2>/dev/null; then
+    echo -e "${GREEN}✓ GRE firewall rule already exists${RESET}"
+  else
+    if iptables -A INPUT -p gre -j ACCEPT 2>/dev/null; then
+      echo -e "${GREEN}✓ Added iptables rule: ACCEPT GRE protocol${RESET}"
+    else
+      echo -e "${RED}✗ Failed to add GRE firewall rule${RESET}"
+      return 1
+    fi
   fi
   
   # Add SIT/IPv6 rules if needed
   if [ "$tunnel_type" = "sit" ] || ls "$CONFIG_DIR"/*.conf 2>/dev/null | grep -q "sit"; then
-    if ! ip6tables -C INPUT -p ipv6 -j ACCEPT 2>/dev/null; then
-      ip6tables -A INPUT -p ipv6 -j ACCEPT
-      echo -e "${GREEN}✓ Added ip6tables rule: ACCEPT IPv6${RESET}"
+    if command -v ip6tables >/dev/null 2>&1; then
+      echo -e "${WHITE}Adding IPv6 firewall rules...${RESET}"
+      if ip6tables -C INPUT -p ipv6 -j ACCEPT 2>/dev/null; then
+        echo -e "${GREEN}✓ IPv6 firewall rule already exists${RESET}"
+      else
+        if ip6tables -A INPUT -p ipv6 -j ACCEPT 2>/dev/null; then
+          echo -e "${GREEN}✓ Added ip6tables rule: ACCEPT IPv6${RESET}"
+        else
+          echo -e "${YELLOW}⚠ Could not add IPv6 firewall rule${RESET}"
+        fi
+      fi
+    else
+      echo -e "${YELLOW}⚠ ip6tables not available, skipping IPv6 rules${RESET}"
     fi
   fi
   
   # Allow ICMP for ping
-  if ! iptables -C INPUT -p icmp -j ACCEPT 2>/dev/null; then
-    iptables -A INPUT -p icmp -j ACCEPT
-    echo -e "${GREEN}✓ Added iptables rule: ACCEPT ICMP${RESET}"
+  echo -e "${WHITE}Adding ICMP firewall rules...${RESET}"
+  if iptables -C INPUT -p icmp -j ACCEPT 2>/dev/null; then
+    echo -e "${GREEN}✓ ICMP firewall rule already exists${RESET}"
+  else
+    if iptables -A INPUT -p icmp -j ACCEPT 2>/dev/null; then
+      echo -e "${GREEN}✓ Added iptables rule: ACCEPT ICMP${RESET}"
+    else
+      echo -e "${RED}✗ Failed to add ICMP firewall rule${RESET}"
+      return 1
+    fi
   fi
   
-  # Save rules
-  iptables-save > /etc/iptables/rules.v4 2>/dev/null
-  ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+  # Try to save rules (non-critical)
+  echo -e "${WHITE}Saving firewall rules...${RESET}"
+  
+  # Try /etc/iptables first
+  if [ -d /etc/iptables ] && [ -w /etc/iptables ]; then
+    if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+      echo -e "${GREEN}✓ IPv4 rules saved to /etc/iptables/rules.v4${RESET}"
+    fi
+    
+    if [ "$tunnel_type" = "sit" ] || ls "$CONFIG_DIR"/*.conf 2>/dev/null | grep -q "sit"; then
+      if command -v ip6tables >/dev/null 2>&1; then
+        if ip6tables-save > /etc/iptables/rules.v6 2>/dev/null; then
+          echo -e "${GREEN}✓ IPv6 rules saved to /etc/iptables/rules.v6${RESET}"
+        fi
+      fi
+    fi
+  else
+    echo -e "${YELLOW}⚠ Could not save rules to /etc/iptables (permission issue)${RESET}"
+  fi
   
   log_message "Firewall configured for $tunnel_type tunnel"
+  echo -e "${GREEN}✓ Firewall configuration completed${RESET}"
+  return 0
 }
 
 # Validate IPv4 address
@@ -160,7 +209,7 @@ enable_ip_forwarding() {
   if [ "$(sysctl -n net.ipv4.ip_forward)" -eq 0 ]; then
     echo -e "${YELLOW}Enabling IPv4 forwarding...${RESET}"
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-gre-forwarding.conf
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-gre-forwarding.conf 2>/dev/null
     echo -e "${GREEN}✓ IPv4 forwarding enabled${RESET}"
   fi
   
@@ -169,7 +218,7 @@ enable_ip_forwarding() {
     if [ "$(sysctl -n net.ipv6.conf.all.forwarding)" -eq 0 ]; then
       echo -e "${YELLOW}Enabling IPv6 forwarding...${RESET}"
       sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-      echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-gre-forwarding.conf
+      echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-gre-forwarding.conf 2>/dev/null
       echo -e "${GREEN}✓ IPv6 forwarding enabled${RESET}"
     fi
   fi
@@ -429,61 +478,128 @@ manage_tunnel() {
     TUNNEL_TYPE=$(grep '^TUNNEL_TYPE=' "$CONFIG_DIR/$DEV.conf" | cut -d'=' -f2)
   fi
   
-  echo -e "${YELLOW}${action^}ing $TUNNEL_TYPE tunnel $DEV...${RESET}"
+  if [ "$action" = "start" ]; then
+    echo -e "${YELLOW}Starting $TUNNEL_TYPE tunnel $DEV...${RESET}"
+  elif [ "$action" = "stop" ]; then
+    echo -e "${YELLOW}Stopping $TUNNEL_TYPE tunnel $DEV...${RESET}"
+  else
+    echo -e "${YELLOW}${action^}ing $TUNNEL_TYPE tunnel $DEV...${RESET}"
+  fi
+  
+  log_message "${action^}ing $TUNNEL_TYPE tunnel $DEV"
   
   # Load kernel modules
+  echo -e "${WHITE}1. Loading kernel modules...${RESET}"
   check_kernel_modules "$TUNNEL_TYPE"
   
   # Enable IP forwarding
+  echo -e "${WHITE}2. Enabling IP forwarding...${RESET}"
   enable_ip_forwarding "$TUNNEL_TYPE"
   
   # Configure firewall
+  echo -e "${WHITE}3. Configuring firewall...${RESET}"
   configure_firewall "$TUNNEL_TYPE"
   
   # Execute script
+  echo -e "${WHITE}4. Executing runtime script...${RESET}"
   if [ -f "$SCRIPT" ]; then
-    "$SCRIPT" "$action" "$DEV"
-    
-    if [ "$action" = "start" ]; then
-      # Start services with retry logic
-      for i in {1..3}; do
-        systemctl start "gre@$DEV" 2>/dev/null
-        sleep 2
-        
-        if ip link show "$DEV" &>/dev/null; then
-          echo -e "${GREEN}✓ Tunnel $DEV started successfully${RESET}"
-          
-          # Start watchdog service
-          systemctl start "gre-watch@$DEV" 2>/dev/null
-          systemctl enable "gre-watch@$DEV" 2>/dev/null
-          
-          # Test connectivity
-          echo -e "${WHITE}Testing tunnel connectivity...${RESET}"
-          sleep 3
-          "$SCRIPT" "status" "$DEV"
-          break
-        else
-          echo -e "${YELLOW}Attempt $i: Tunnel not up, retrying...${RESET}"
-          if [ $i -eq 3 ]; then
-            echo -e "${RED}Failed to start tunnel $DEV after 3 attempts${RESET}"
-            return 1
-          fi
-          sleep 2
-        fi
-      done
+    # Run script directly without timeout to avoid hanging
+    if "$SCRIPT" "$action" "$DEV" 2>&1; then
+      echo -e "${GREEN}✓ Script executed successfully${RESET}"
     else
-      # Stop services
-      systemctl stop "gre-watch@$DEV" 2>/dev/null
-      systemctl disable "gre-watch@$DEV" 2>/dev/null
-      systemctl stop "gre@$DEV" 2>/dev/null
-      echo -e "${YELLOW}✓ Tunnel $DEV stopped${RESET}"
-      echo -e "${YELLOW}Note: Tunnel will NOT auto-restart when manually stopped${RESET}"
+      local exit_code=$?
+      echo -e "${RED}✗ Script execution failed with code: $exit_code${RESET}"
+      
+      # Try alternative method for starting
+      if [ "$action" = "start" ]; then
+        echo -e "${YELLOW}Trying alternative startup method...${RESET}"
+        start_tunnel_directly "$DEV"
+      fi
     fi
   else
-    echo -e "${RED}Runtime script not found!${RESET}"
+    echo -e "${RED}Runtime script not found at $SCRIPT!${RESET}"
     return 1
   fi
   
+  if [ "$action" = "start" ]; then
+    # Start watchdog service
+    echo -e "${WHITE}5. Starting watchdog service...${RESET}"
+    systemctl start "gre-watch@$DEV" 2>/dev/null
+    systemctl enable "gre-watch@$DEV" 2>/dev/null
+    echo -e "${GREEN}✓ Tunnel $DEV started${RESET}"
+    log_message "Tunnel $DEV started successfully"
+  else
+    # Stop watchdog service
+    echo -e "${WHITE}5. Stopping watchdog service...${RESET}"
+    systemctl stop "gre-watch@$DEV" 2>/dev/null
+    systemctl disable "gre-watch@$DEV" 2>/dev/null
+    echo -e "${YELLOW}✓ Tunnel $DEV stopped${RESET}"
+    echo -e "${YELLOW}Note: Tunnel will NOT auto-restart when manually stopped${RESET}"
+    log_message "Tunnel $DEV stopped"
+  fi
+  
+  echo -e "${WHITE}6. Finalizing...${RESET}"
+  sleep 1
+  return 0
+}
+
+# Alternative direct tunnel startup
+start_tunnel_directly() {
+  local DEV="$1"
+  
+  echo -e "${YELLOW}Starting tunnel $DEV directly...${RESET}"
+  
+  # Read config
+  local LOCAL_IP REMOTE_IP TUN_IP TUNNEL_TYPE PING_TARGET
+  LOCAL_IP=$(grep '^LOCAL_IP=' "$CONFIG_DIR/$DEV.conf" | cut -d'=' -f2)
+  REMOTE_IP=$(grep '^REMOTE_IP=' "$CONFIG_DIR/$DEV.conf" | cut -d'=' -f2)
+  TUN_IP=$(grep '^TUN_IP=' "$CONFIG_DIR/$DEV.conf" | cut -d'=' -f2)
+  TUNNEL_TYPE=$(grep '^TUNNEL_TYPE=' "$CONFIG_DIR/$DEV.conf" | cut -d'=' -f2)
+  PING_TARGET=$(grep '^PING_TARGET=' "$CONFIG_DIR/$DEV.conf" | cut -d'=' -f2)
+  
+  echo -e "${WHITE}Config: Local=$LOCAL_IP, Remote=$REMOTE_IP, Tunnel=$TUN_IP${RESET}"
+  
+  # Remove existing tunnel
+  ip tunnel del "$DEV" 2>/dev/null && echo -e "${GREEN}✓ Removed existing tunnel${RESET}"
+  
+  # Create tunnel
+  if ip tunnel add "$DEV" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 2>&1; then
+    echo -e "${GREEN}✓ Tunnel created${RESET}"
+  else
+    echo -e "${RED}✗ Failed to create tunnel${RESET}"
+    return 1
+  fi
+  
+  # Configure IP
+  if [[ "$TUN_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    TUN_IP="$TUN_IP/30"
+  fi
+  
+  if ip addr add "$TUN_IP" dev "$DEV" 2>&1; then
+    echo -e "${GREEN}✓ IP address configured${RESET}"
+  else
+    echo -e "${YELLOW}⚠ Could not configure IP address${RESET}"
+  fi
+  
+  # Bring interface up
+  if ip link set "$DEV" up 2>&1; then
+    echo -e "${GREEN}✓ Interface brought up${RESET}"
+  else
+    echo -e "${RED}✗ Failed to bring interface up${RESET}"
+    return 1
+  fi
+  
+  # Test connectivity
+  echo -e "${WHITE}Testing connectivity...${RESET}"
+  sleep 2
+  
+  if ping -c2 -W3 "$PING_TARGET" >/dev/null 2>&1; then
+    echo -e "${GREEN}✓ Connectivity test passed${RESET}"
+  else
+    echo -e "${YELLOW}⚠ Connectivity test failed (tunnel up but ping failed)${RESET}"
+  fi
+  
+  echo -e "${GREEN}✓ Tunnel $DEV started directly${RESET}"
   return 0
 }
 
@@ -492,10 +608,25 @@ restart_tunnel() {
   local DEV="$1"
   
   echo -e "${YELLOW}Restarting tunnel $DEV...${RESET}"
+  
+  # First stop
+  echo -e "${WHITE}Phase 1: Stopping tunnel...${RESET}"
   manage_tunnel "stop" "$DEV"
+  
+  # Wait
+  echo -e "${WHITE}Waiting 3 seconds...${RESET}"
   sleep 3
-  manage_tunnel "start" "$DEV"
-  echo -e "${GREEN}✓ Tunnel $DEV restarted${RESET}"
+  
+  # Then start
+  echo -e "${WHITE}Phase 2: Starting tunnel...${RESET}"
+  if manage_tunnel "start" "$DEV"; then
+    echo -e "${GREEN}✓ Tunnel $DEV restarted${RESET}"
+  else
+    echo -e "${RED}✗ Failed to restart tunnel $DEV${RESET}"
+    return 1
+  fi
+  
+  return 0
 }
 
 delete_tunnel() {
@@ -854,10 +985,10 @@ manage_tunnel_menu() {
     5)
       echo -e "\n${WHITE}Recent logs for $DEV:${RESET}"
       echo -e "=========================================================="
-      grep "$DEV" "$LOG_FILE" | tail -10
+      grep "$DEV" "$LOG_FILE" 2>/dev/null | tail -10 || echo "No log entries found"
       echo -e "\n${WHITE}Watchdog logs:${RESET}"
       echo -e "=========================================================="
-      grep "$DEV" "$WATCH_LOG" | tail -10
+      grep "$DEV" "$WATCH_LOG" 2>/dev/null | tail -10 || echo "No watchdog log entries found"
       ;;
     6)
       return 0
@@ -874,11 +1005,10 @@ manage_tunnel_menu() {
 # ---------- GRE/SIT Runtime Script ----------
 
 create_or_update_gre_script() {
-  # Only create if script doesn't exist
-  if [ ! -f "$SCRIPT" ]; then
-    echo -e "${YELLOW}Creating GRE/SIT runtime script...${RESET}"
-    
-    cat > "$SCRIPT" <<'EOF'
+  # Create the script file
+  echo -e "${YELLOW}Creating GRE/SIT runtime script...${RESET}"
+  
+  cat > "$SCRIPT" <<'EOF'
 #!/bin/bash
 
 CONF="/etc/gre/$2.conf"
@@ -912,16 +1042,16 @@ if [ "$TUNNEL_TYPE" = "sit" ]; then
 fi
 
 # Configure firewall
+iptables -A INPUT -p gre -j ACCEPT 2>/dev/null
+iptables -A INPUT -p icmp -j ACCEPT 2>/dev/null
 if [ "$TUNNEL_TYPE" = "sit" ]; then
   ip6tables -A INPUT -p ipv6 -j ACCEPT 2>/dev/null
-else
-  iptables -A INPUT -p gre -j ACCEPT 2>/dev/null
 fi
-iptables -A INPUT -p icmp -j ACCEPT 2>/dev/null
 
 case "$1" in
   start)
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting $TUNNEL_TYPE tunnel $DEV" | tee -a /var/log/gre-tunnel.log
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting $TUNNEL_TYPE tunnel $DEV" >> /var/log/gre-tunnel.log
+    echo "Starting $TUNNEL_TYPE tunnel $DEV"
     
     # Remove existing tunnel if exists
     ip tunnel del "$DEV" 2>/dev/null
@@ -930,16 +1060,13 @@ case "$1" in
     # Create tunnel based on type
     if [ "$TUNNEL_TYPE" = "sit" ]; then
       ip tunnel add "$DEV" mode sit local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
-      if [ $? -ne 0 ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - Failed to create SIT tunnel $DEV" >> /var/log/gre-tunnel.log
-        exit 1
-      fi
     else
       ip tunnel add "$DEV" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
-      if [ $? -ne 0 ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - Failed to create GRE tunnel $DEV" >> /var/log/gre-tunnel.log
-        exit 1
-      fi
+    fi
+    
+    if [ $? -ne 0 ]; then
+      echo "Failed to create tunnel $DEV"
+      exit 1
     fi
     
     # Set IP based on tunnel type
@@ -973,7 +1100,7 @@ case "$1" in
       ip addr show dev "$DEV" 2>/dev/null || echo "No IPv4 address configured"
     fi
     
-    # Initial connectivity test (non-blocking)
+    # Initial connectivity test
     echo "Performing initial connectivity test..."
     if [ "$TUNNEL_TYPE" = "sit" ]; then
       timeout 10 ping6 -c2 "$PING_TARGET" >/dev/null 2>&1 && \
@@ -986,7 +1113,8 @@ case "$1" in
     fi
     ;;
   stop)
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Stopping $TUNNEL_TYPE tunnel $DEV" | tee -a /var/log/gre-tunnel.log
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Stopping $TUNNEL_TYPE tunnel $DEV" >> /var/log/gre-tunnel.log
+    echo "Stopping $TUNNEL_TYPE tunnel $DEV"
     
     # Mark as manually stopped (prevent auto-restart)
     touch "/tmp/gre-$DEV-manually-stopped" 2>/dev/null
@@ -1001,7 +1129,7 @@ case "$1" in
     ;;
   restart)
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Restarting $TUNNEL_TYPE tunnel $DEV" >> /var/log/gre-tunnel.log
-    echo "Restarting $TUNNEL_TYPE tunnel $DEV..."
+    echo "Restarting $TUNNEL_TYPE tunnel $DEV"
     
     # Remove manual stop flag
     rm -f "/tmp/gre-$DEV-manually-stopped" 2>/dev/null
@@ -1114,12 +1242,9 @@ case "$1" in
     ;;
 esac
 EOF
-    
-    chmod +x "$SCRIPT"
-    echo -e "${GREEN}✓ GRE/SIT runtime script created at $SCRIPT${RESET}"
-  else
-    echo -e "${WHITE}✓ GRE/SIT runtime script already exists${RESET}"
-  fi
+  
+  chmod +x "$SCRIPT"
+  echo -e "${GREEN}✓ GRE/SIT runtime script created at $SCRIPT${RESET}"
 }
 
 # ---------- Services ----------
@@ -1394,6 +1519,64 @@ EOF
   pause
 }
 
+# ---------- System Fix Functions ----------
+
+fix_system_issues() {
+  show_banner
+  echo -e "=========================================================="
+  echo -e "${WHITE}                FIX SYSTEM ISSUES                  ${RESET}"
+  echo -e "=========================================================="
+  
+  echo -e "\n${WHITE}1. Creating required directories...${RESET}"
+  mkdir -p /etc/iptables 2>/dev/null || echo -e "${YELLOW}⚠ Could not create /etc/iptables${RESET}"
+  mkdir -p /etc/gre 2>/dev/null || echo -e "${YELLOW}⚠ Could not create /etc/gre${RESET}"
+  mkdir -p /usr/local/bin 2>/dev/null || echo -e "${YELLOW}⚠ Could not create /usr/local/bin${RESET}"
+  mkdir -p /etc/systemd/system 2>/dev/null || echo -e "${YELLOW}⚠ Could not create /etc/systemd/system${RESET}"
+  
+  echo -e "${GREEN}✓ Directories created${RESET}"
+  
+  echo -e "\n${WHITE}2. Setting permissions...${RESET}"
+  chmod 755 /etc/iptables 2>/dev/null || true
+  chmod 755 /etc/gre 2>/dev/null || true
+  chmod +x /usr/local/bin/gre.sh 2>/dev/null || true
+  
+  echo -e "${GREEN}✓ Permissions set${RESET}"
+  
+  echo -e "\n${WHITE}3. Creating iptables rules files...${RESET}"
+  # Create empty rules files if they don't exist
+  touch /etc/iptables/rules.v4 2>/dev/null || echo -e "${YELLOW}⚠ Could not create rules.v4${RESET}"
+  touch /etc/iptables/rules.v6 2>/dev/null || echo -e "${YELLOW}⚠ Could not create rules.v6${RESET}"
+  
+  echo -e "${GREEN}✓ Rules files created${RESET}"
+  
+  echo -e "\n${WHITE}4. Reloading systemd...${RESET}"
+  systemctl daemon-reload
+  systemctl reset-failed 2>/dev/null
+  
+  echo -e "${GREEN}✓ Systemd reloaded${RESET}"
+  
+  echo -e "\n${WHITE}5. Testing iptables...${RESET}"
+  if command -v iptables >/dev/null 2>&1; then
+    echo -e "${GREEN}✓ iptables command available${RESET}"
+  else
+    echo -e "${RED}✗ iptables not found${RESET}"
+  fi
+  
+  echo -e "\n${WHITE}6. Creating runtime script if missing...${RESET}"
+  create_or_update_gre_script
+  
+  echo -e "\n${WHITE}7. Creating log files...${RESET}"
+  touch /var/log/gre-tunnel.log 2>/dev/null || true
+  touch /var/log/gre-watch.log 2>/dev/null || true
+  chmod 666 /var/log/gre-tunnel.log /var/log/gre-watch.log 2>/dev/null || true
+  
+  echo -e "${GREEN}✓ Log files created${RESET}"
+  
+  echo -e "\n${GREEN}✓ System issues fixed${RESET}"
+  echo -e "=========================================================="
+  pause
+}
+
 # ---------- Main Menu ----------
 
 while true; do
@@ -1409,10 +1592,11 @@ while true; do
   echo -e "${WHITE}  5) List all tunnels${RESET}"
   echo -e "${WHITE}  6) View system logs${RESET}"
   echo -e "${WHITE}  7) Configure firewall${RESET}"
-  echo -e "${WHITE}  8) Exit${RESET}"
+  echo -e "${WHITE}  8) Fix system issues${RESET}"
+  echo -e "${WHITE}  9) Exit${RESET}"
   echo
   echo -e "=========================================================="
-  read -rp "Select option [1-8]: " opt
+  read -rp "Select option [1-9]: " opt
 
   case "$opt" in
     1) create_tunnel ;;
@@ -1451,7 +1635,10 @@ while true; do
       ip6tables -L INPUT -n | grep -E "(ipv6)" || echo "No IPv6 rules found"
       pause
       ;;
-    8) 
+    8)
+      fix_system_issues
+      ;;
+    9) 
       echo -e "\n${WHITE}Goodbye!${RESET}"
       exit 0
       ;;
