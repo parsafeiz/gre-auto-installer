@@ -33,7 +33,7 @@ show_banner() {
   echo " | |__| | | \ \| |____     | |  | |\  | |___| | |  __/  "
   echo "  \_____|_|  \_\______|    |_|  |_| \_|_____|_|_|\___|  "
   echo "                                                        "
-  echo "           GRE/SIT Tunnel Manager v3.2                 "
+  echo "           GRE/SIT Tunnel Manager v3.3                 "
   echo "           Auto-Recovery Tunnel System                "
   echo "           Created by: Parsa                           "
   echo "=========================================================="
@@ -489,57 +489,112 @@ manage_tunnel() {
   log_message "${action^}ing $TUNNEL_TYPE tunnel $DEV"
   
   # Load kernel modules
-  echo -e "${WHITE}1. Loading kernel modules...${RESET}"
   check_kernel_modules "$TUNNEL_TYPE"
   
   # Enable IP forwarding
-  echo -e "${WHITE}2. Enabling IP forwarding...${RESET}"
   enable_ip_forwarding "$TUNNEL_TYPE"
   
   # Configure firewall
-  echo -e "${WHITE}3. Configuring firewall...${RESET}"
   configure_firewall "$TUNNEL_TYPE"
   
-  # Execute script
-  echo -e "${WHITE}4. Executing runtime script...${RESET}"
+  # Execute script in background with timeout
   if [ -f "$SCRIPT" ]; then
-    # Run script directly without timeout to avoid hanging
-    if "$SCRIPT" "$action" "$DEV" 2>&1; then
-      echo -e "${GREEN}✓ Script executed successfully${RESET}"
-    else
-      local exit_code=$?
-      echo -e "${RED}✗ Script execution failed with code: $exit_code${RESET}"
+    echo -e "${WHITE}Executing runtime script...${RESET}"
+    
+    # Run script in background
+    local script_pid
+    "$SCRIPT" "$action" "$DEV" &
+    script_pid=$!
+    
+    # Wait for script with timeout
+    local timeout=15
+    local count=0
+    while kill -0 "$script_pid" 2>/dev/null && [ $count -lt $timeout ]; do
+      sleep 1
+      ((count++))
+      echo -n "."
+    done
+    
+    echo  # New line after dots
+    
+    if kill -0 "$script_pid" 2>/dev/null; then
+      # Script is still running, kill it
+      echo -e "${YELLOW}⚠ Script timed out after ${timeout} seconds, killing...${RESET}"
+      kill -9 "$script_pid" 2>/dev/null
+      echo -e "${RED}✗ Script execution timed out${RESET}"
       
       # Try alternative method for starting
       if [ "$action" = "start" ]; then
-        echo -e "${YELLOW}Trying alternative startup method...${RESET}"
+        echo -e "${YELLOW}Trying direct tunnel creation...${RESET}"
         start_tunnel_directly "$DEV"
+      fi
+    else
+      # Script completed
+      wait "$script_pid"
+      local exit_code=$?
+      
+      if [ $exit_code -eq 0 ]; then
+        echo -e "${GREEN}✓ Script executed successfully${RESET}"
+      else
+        echo -e "${RED}✗ Script failed with code: $exit_code${RESET}"
+        
+        # Try alternative method for starting
+        if [ "$action" = "start" ]; then
+          echo -e "${YELLOW}Trying direct tunnel creation...${RESET}"
+          start_tunnel_directly "$DEV"
+        fi
       fi
     fi
   else
-    echo -e "${RED}Runtime script not found at $SCRIPT!${RESET}"
+    echo -e "${RED}Runtime script not found!${RESET}"
     return 1
   fi
   
   if [ "$action" = "start" ]; then
     # Start watchdog service
-    echo -e "${WHITE}5. Starting watchdog service...${RESET}"
+    echo -e "${WHITE}Starting watchdog service...${RESET}"
     systemctl start "gre-watch@$DEV" 2>/dev/null
     systemctl enable "gre-watch@$DEV" 2>/dev/null
-    echo -e "${GREEN}✓ Tunnel $DEV started${RESET}"
-    log_message "Tunnel $DEV started successfully"
+    
+    # Verify tunnel is up
+    echo -e "${WHITE}Verifying tunnel status...${RESET}"
+    sleep 2
+    
+    if ip link show "$DEV" &>/dev/null; then
+      echo -e "${GREEN}✓ Tunnel $DEV is UP${RESET}"
+      
+      # Show tunnel details
+      echo -e "${WHITE}Tunnel details:${RESET}"
+      ip addr show dev "$DEV" 2>/dev/null || echo "No IP configured"
+      
+      # Test connectivity
+      local PING_TARGET
+      PING_TARGET=$(grep '^PING_TARGET=' "$CONFIG_DIR/$DEV.conf" | cut -d'=' -f2)
+      
+      if [ -n "$PING_TARGET" ]; then
+        echo -e "${WHITE}Testing connectivity to $PING_TARGET...${RESET}"
+        if ping -c2 -W3 "$PING_TARGET" >/dev/null 2>&1; then
+          echo -e "${GREEN}✓ Connectivity test passed${RESET}"
+        else
+          echo -e "${YELLOW}⚠ Connectivity test failed (tunnel up but ping failed)${RESET}"
+        fi
+      fi
+    else
+      echo -e "${RED}✗ Tunnel $DEV failed to start${RESET}"
+      return 1
+    fi
+    
+    echo -e "${GREEN}✓ Tunnel $DEV started successfully${RESET}"
   else
     # Stop watchdog service
-    echo -e "${WHITE}5. Stopping watchdog service...${RESET}"
+    echo -e "${WHITE}Stopping watchdog service...${RESET}"
     systemctl stop "gre-watch@$DEV" 2>/dev/null
     systemctl disable "gre-watch@$DEV" 2>/dev/null
+    
     echo -e "${YELLOW}✓ Tunnel $DEV stopped${RESET}"
     echo -e "${YELLOW}Note: Tunnel will NOT auto-restart when manually stopped${RESET}"
-    log_message "Tunnel $DEV stopped"
   fi
   
-  echo -e "${WHITE}6. Finalizing...${RESET}"
-  sleep 1
   return 0
 }
 
@@ -559,44 +614,66 @@ start_tunnel_directly() {
   
   echo -e "${WHITE}Config: Local=$LOCAL_IP, Remote=$REMOTE_IP, Tunnel=$TUN_IP${RESET}"
   
-  # Remove existing tunnel
-  ip tunnel del "$DEV" 2>/dev/null && echo -e "${GREEN}✓ Removed existing tunnel${RESET}"
+  # Remove any existing tunnel
+  echo -e "${WHITE}Cleaning up existing tunnel...${RESET}"
+  ip link set "$DEV" down 2>/dev/null
+  ip tunnel del "$DEV" 2>/dev/null
+  sleep 1
   
   # Create tunnel
-  if ip tunnel add "$DEV" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 2>&1; then
-    echo -e "${GREEN}✓ Tunnel created${RESET}"
-  else
+  echo -e "${WHITE}Creating tunnel...${RESET}"
+  if ! ip tunnel add "$DEV" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 2>&1; then
     echo -e "${RED}✗ Failed to create tunnel${RESET}"
-    return 1
+    echo -e "${YELLOW}Trying alternative method...${RESET}"
+    
+    # Try without ttl
+    if ! ip tunnel add "$DEV" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" 2>&1; then
+      echo -e "${RED}✗ Failed to create tunnel (alternative method also failed)${RESET}"
+      return 1
+    fi
   fi
   
+  echo -e "${GREEN}✓ Tunnel created${RESET}"
+  
   # Configure IP
+  echo -e "${WHITE}Configuring IP address...${RESET}"
   if [[ "$TUN_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
     TUN_IP="$TUN_IP/30"
   fi
   
-  if ip addr add "$TUN_IP" dev "$DEV" 2>&1; then
-    echo -e "${GREEN}✓ IP address configured${RESET}"
+  if ! ip addr add "$TUN_IP" dev "$DEV" 2>&1; then
+    echo -e "${YELLOW}⚠ Could not configure IP address, continuing...${RESET}"
   else
-    echo -e "${YELLOW}⚠ Could not configure IP address${RESET}"
+    echo -e "${GREEN}✓ IP address configured${RESET}"
   fi
   
   # Bring interface up
-  if ip link set "$DEV" up 2>&1; then
-    echo -e "${GREEN}✓ Interface brought up${RESET}"
-  else
+  echo -e "${WHITE}Bringing interface up...${RESET}"
+  if ! ip link set "$DEV" up 2>&1; then
     echo -e "${RED}✗ Failed to bring interface up${RESET}"
     return 1
   fi
   
-  # Test connectivity
-  echo -e "${WHITE}Testing connectivity...${RESET}"
+  echo -e "${GREEN}✓ Interface brought up${RESET}"
+  
+  # Wait for interface to stabilize
   sleep 2
   
-  if ping -c2 -W3 "$PING_TARGET" >/dev/null 2>&1; then
-    echo -e "${GREEN}✓ Connectivity test passed${RESET}"
-  else
-    echo -e "${YELLOW}⚠ Connectivity test failed (tunnel up but ping failed)${RESET}"
+  # Show tunnel status
+  echo -e "${WHITE}Tunnel status:${RESET}"
+  ip link show "$DEV" 2>/dev/null | grep -E "state|mtu"
+  ip addr show dev "$DEV" 2>/dev/null | grep inet || echo "No IP address visible yet"
+  
+  # Test connectivity (optional)
+  if [ -n "$PING_TARGET" ]; then
+    echo -e "${WHITE}Testing connectivity to $PING_TARGET...${RESET}"
+    sleep 2
+    
+    if ping -c2 -W3 "$PING_TARGET" >/dev/null 2>&1; then
+      echo -e "${GREEN}✓ Connectivity test passed${RESET}"
+    else
+      echo -e "${YELLOW}⚠ Connectivity test failed (but tunnel is up)${RESET}"
+    fi
   fi
   
   echo -e "${GREEN}✓ Tunnel $DEV started directly${RESET}"
@@ -1041,7 +1118,7 @@ if [ "$TUNNEL_TYPE" = "sit" ]; then
   sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
 fi
 
-# Configure firewall
+# Configure firewall (quick and non-blocking)
 iptables -A INPUT -p gre -j ACCEPT 2>/dev/null
 iptables -A INPUT -p icmp -j ACCEPT 2>/dev/null
 if [ "$TUNNEL_TYPE" = "sit" ]; then
@@ -1059,19 +1136,20 @@ case "$1" in
     
     # Create tunnel based on type
     if [ "$TUNNEL_TYPE" = "sit" ]; then
-      ip tunnel add "$DEV" mode sit local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
+      if ! ip tunnel add "$DEV" mode sit local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 2>/dev/null; then
+        echo "Failed to create SIT tunnel $DEV"
+        exit 1
+      fi
     else
-      ip tunnel add "$DEV" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
-    fi
-    
-    if [ $? -ne 0 ]; then
-      echo "Failed to create tunnel $DEV"
-      exit 1
+      if ! ip tunnel add "$DEV" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 2>/dev/null; then
+        echo "Failed to create GRE tunnel $DEV"
+        exit 1
+      fi
     fi
     
     # Set IP based on tunnel type
     if [ "$TUNNEL_TYPE" = "sit" ]; then
-      ip -6 addr add "$TUN_IP" dev "$DEV"
+      ip -6 addr add "$TUN_IP" dev "$DEV" 2>/dev/null
       # Enable IPv6
       sysctl -w net.ipv6.conf.$DEV.disable_ipv6=0 >/dev/null 2>&1
       sysctl -w net.ipv6.conf.$DEV.autoconf=0 >/dev/null 2>&1
@@ -1081,10 +1159,10 @@ case "$1" in
       if [[ "$TUN_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         TUN_IP="$TUN_IP/30"
       fi
-      ip addr add "$TUN_IP" dev "$DEV"
+      ip addr add "$TUN_IP" dev "$DEV" 2>/dev/null
     fi
     
-    ip link set "$DEV" up
+    ip link set "$DEV" up 2>/dev/null
     
     # Wait for interface to stabilize
     sleep 2
@@ -1100,14 +1178,14 @@ case "$1" in
       ip addr show dev "$DEV" 2>/dev/null || echo "No IPv4 address configured"
     fi
     
-    # Initial connectivity test
-    echo "Performing initial connectivity test..."
+    # Quick connectivity test (non-blocking)
+    echo "Testing connectivity..."
     if [ "$TUNNEL_TYPE" = "sit" ]; then
-      timeout 10 ping6 -c2 "$PING_TARGET" >/dev/null 2>&1 && \
+      timeout 5 ping6 -c1 "$PING_TARGET" >/dev/null 2>&1 && \
         echo "✓ Initial connectivity: PASS" || \
         echo "⚠ Initial connectivity: FAIL (may need more time)"
     else
-      timeout 10 ping -c2 "$PING_TARGET" >/dev/null 2>&1 && \
+      timeout 5 ping -c1 "$PING_TARGET" >/dev/null 2>&1 && \
         echo "✓ Initial connectivity: PASS" || \
         echo "⚠ Initial connectivity: FAIL (may need more time)"
     fi
@@ -1155,38 +1233,28 @@ case "$1" in
       exit 0
     fi
     
-    # Enhanced ping check with multiple attempts
-    local max_attempts=3
-    local attempts=0
-    local success=0
-    
-    for ((attempts=1; attempts<=max_attempts; attempts++)); do
-      if [ "$TUNNEL_TYPE" = "sit" ]; then
-        if timeout 15 ping6 -c2 -W5 "$PING_TARGET" >/dev/null 2>&1; then
-          success=1
-          break
+    # Quick ping check
+    if [ "$TUNNEL_TYPE" = "sit" ]; then
+      if timeout 10 ping6 -c2 -W3 "$PING_TARGET" >/dev/null 2>&1; then
+        # Log success occasionally
+        if [ $((RANDOM % 10)) -eq 0 ]; then
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Ping OK" >> /var/log/gre-watch.log
         fi
       else
-        if timeout 15 ping -c2 -W5 "$PING_TARGET" >/dev/null 2>&1; then
-          success=1
-          break
-        fi
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Ping FAILED, restarting..." >> /var/log/gre-watch.log
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Connectivity lost, restarting tunnel" >> /var/log/gre-tunnel.log
+        "$0" restart "$DEV"
       fi
-      
-      if [ $attempts -lt $max_attempts ]; then
-        sleep 3
-      fi
-    done
-    
-    if [ $success -eq 0 ]; then
-      echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Ping FAILED after $max_attempts attempts, restarting..." >> /var/log/gre-watch.log
-      echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Connectivity lost, restarting tunnel" >> /var/log/gre-tunnel.log
-      "$0" restart "$DEV"
     else
-      # Log successful check periodically (every 10th check)
-      local check_count=$((RANDOM % 10))
-      if [ $check_count -eq 0 ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Ping OK" >> /var/log/gre-watch.log
+      if timeout 10 ping -c2 -W3 "$PING_TARGET" >/dev/null 2>&1; then
+        # Log success occasionally
+        if [ $((RANDOM % 10)) -eq 0 ]; then
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Ping OK" >> /var/log/gre-watch.log
+        fi
+      else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Ping FAILED, restarting..." >> /var/log/gre-watch.log
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $DEV: Connectivity lost, restarting tunnel" >> /var/log/gre-tunnel.log
+        "$0" restart "$DEV"
       fi
     fi
     ;;
@@ -1211,16 +1279,16 @@ case "$1" in
         ip addr show dev "$DEV" 2>/dev/null | grep inet || echo "  No IPv4 address"
       fi
       
-      # Test connectivity
+      # Quick connectivity test
       echo -n "Connectivity test: "
       if [ "$TUNNEL_TYPE" = "sit" ]; then
-        if timeout 5 ping6 -c1 "$PING_TARGET" >/dev/null 2>&1; then
+        if timeout 3 ping6 -c1 "$PING_TARGET" >/dev/null 2>&1; then
           echo -e "\e[32mPASS\e[0m"
         else
           echo -e "\e[31mFAIL\e[0m"
         fi
       else
-        if timeout 5 ping -c1 "$PING_TARGET" >/dev/null 2>&1; then
+        if timeout 3 ping -c1 "$PING_TARGET" >/dev/null 2>&1; then
           echo -e "\e[32mPASS\e[0m"
         else
           echo -e "\e[31mFAIL\e[0m"
@@ -1474,16 +1542,23 @@ EOF
   echo -e "\n${YELLOW}Starting tunnel...${RESET}"
   systemctl daemon-reload
   
-  # Enable and start services
-  systemctl enable --now "gre@$DEV" >/dev/null 2>&1
-  systemctl enable --now "gre-watch@$DEV" >/dev/null 2>&1
+  # Enable services (but don't start yet)
+  systemctl enable "gre@$DEV" >/dev/null 2>&1
+  systemctl enable "gre-watch@$DEV" >/dev/null 2>&1
   
   # Remove any manual stop flag
   rm -f "/tmp/gre-$DEV-manually-stopped" 2>/dev/null
   
-  # Manually start tunnel to ensure it's up
-  sleep 2
-  manage_tunnel "start" "$DEV"
+  # Start tunnel manually (not through systemd to avoid hang)
+  echo -e "${WHITE}Starting tunnel manually...${RESET}"
+  if manage_tunnel "start" "$DEV"; then
+    echo -e "${GREEN}✓ Tunnel started successfully${RESET}"
+  else
+    echo -e "${RED}✗ Failed to start tunnel${RESET}"
+    echo -e "${YELLOW}But configuration was saved. You can try to start it from the management menu.${RESET}"
+    pause
+    return 1
+  fi
 
   echo -e "=========================================================="
   echo -e "${GREEN}✓ $TUNNEL_TYPE tunnel $DEV created successfully!${RESET}"
